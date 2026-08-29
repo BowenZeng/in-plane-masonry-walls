@@ -18,7 +18,7 @@ WallResult = engine.WallResult
 calculate_wall = engine.calculate_wall
 
 
-BUILD_MARKER = "2026-08-29.03"
+BUILD_MARKER = "2026-08-29.04"
 SOURCE_URL = "https://github.com/BowenZeng/in-plane-masonry-walls"
 
 
@@ -408,12 +408,12 @@ def main() -> None:
         tie_spacing=float(tie_spacing),
         horizontal_reinforcement_type=horizontal_type,
         horizontal_bar_size=horizontal_bar_size,
-        horizontal_reinforcement_area=float(av),
+        horizontal_reinforcement_area=float(av) if horizontal_type != "None" else 0.0,
         horizontal_reinforcement_spacing=float(shear_spacing),
         horizontal_fy=float(horizontal_fy),
-        horizontal_anchorage_confirmed=bool(horizontal_anchored),
-        horizontal_continuity_confirmed=bool(horizontal_continuous),
-        horizontal_top_bar=bool(horizontal_top_bar),
+        horizontal_anchorage_confirmed=bool(horizontal_anchored and horizontal_type != "None"),
+        horizontal_continuity_confirmed=bool(horizontal_continuous and horizontal_type != "None"),
+        horizontal_top_bar=bool(horizontal_top_bar and horizontal_type == "Bond beam bars"),
         shear_method=shear_method,
         grout_type=grout_type,
         factored_axial=float(pf),

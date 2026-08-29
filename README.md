@@ -37,4 +37,6 @@ The 40-case verification matrix covers cantilever and fixed-fixed demand pattern
 
 ## Deployment
 
-Streamlit Community Cloud can deploy this directory with `streamlit_app.py` as the entry point. Publish only after the calculation scope and repository target have been reviewed.
+Live app: https://in-plane-wall-bowen.streamlit.app/
+
+Streamlit Community Cloud deploys `main` with `streamlit_app.py` as the entry point.
