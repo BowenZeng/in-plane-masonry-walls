@@ -1,0 +1,1599 @@
+"""CSA S304 in-plane masonry wall design engine.
+
+The engine is independent of Streamlit.  It covers rectangular, solid wall
+segments without openings for the three public routes in the UI:
+
+* unreinforced hollow concrete masonry;
+* fully grouted reinforced concrete masonry; and
+* partially grouted reinforced concrete masonry.
+
+Lengths are millimetres, stresses are MPa, forces are kN, and moments are
+kN-m unless a field says otherwise.  Compression is positive.  The tool is a
+validated draft, not a substitute for project-specific engineering review.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+from typing import Literal
+
+
+Edition = Literal["S304-14", "S304:24"]
+WallType = Literal[
+    "Unreinforced masonry",
+    "Fully grouted reinforced masonry",
+    "Partially grouted reinforced masonry",
+]
+CheckLevel = Literal["pass", "warning", "blocked"]
+
+PHI_M = 0.60
+PHI_S = 0.85
+E_S = 200_000.0
+EPS_MU = 0.003
+ECCENTRICITY_LIMIT = 0.33
+
+BAR_PROPERTIES = {
+    "10M": (100.0, 10.0),
+    "15M": (200.0, 15.0),
+    "20M": (300.0, 20.0),
+    "25M": (500.0, 25.0),
+}
+BAR_AREAS = {size: values[0] for size, values in BAR_PROPERTIES.items()}
+
+# Concrete masonry values from the edition-specific CSA S304 Table 4 routes.
+# Each pair is (ungrouted, fully grouted), in MPa.
+_FM_TABLE: dict[Edition, dict[str, dict[float, tuple[float, float]]]] = {
+    "S304-14": {
+        "Type S": {
+            10.0: (6.5, 5.0),
+            15.0: (10.0, 7.5),
+            20.0: (13.0, 10.0),
+            30.0: (17.5, 13.5),
+        },
+        "Type N": {
+            10.0: (6.0, 4.5),
+            15.0: (8.0, 6.0),
+            20.0: (10.0, 7.5),
+            30.0: (12.0, 9.0),
+        },
+    },
+    "S304:24": {
+        "Type S": {
+            10.0: (7.5, 6.0),
+            15.0: (12.0, 9.0),
+            20.0: (15.5, 12.0),
+            30.0: (20.5, 16.0),
+        },
+        "Type N": {
+            10.0: (7.0, 5.5),
+            15.0: (9.5, 7.0),
+            20.0: (12.0, 9.0),
+            30.0: (14.0, 10.5),
+        },
+    },
+}
+
+_FT_TABLE = {
+    "Hollow ungrouted": {"Type S": 0.40, "Type N": 0.30},
+    "Fully grouted hollow": {"Type S": 0.65, "Type N": 0.50},
+    "Solid units": {"Type S": 0.40, "Type N": 0.30},
+}
+
+
+@dataclass(frozen=True)
+class WallInput:
+    edition: Edition = "S304-14"
+    wall_type: WallType = "Fully grouted reinforced masonry"
+    length: float = 5000.0
+    height: float = 5000.0
+    thickness: float = 190.0
+    nominal_unit_strength: float = 15.0
+    mortar_type: str = "Type S"
+    bond_pattern: str = "Running bond"
+    unreinforced_condition: str = "Hollow ungrouted"
+    partial_grout_method: str = "Use lower of discrete and smeared"
+    unit_geometry_confirmed: bool = False
+    face_shell_thickness: float = 36.2
+    grouted_cell_width: float = 200.0
+    bar_size: str = "15M"
+    bar_count: int = 5
+    end_bar_distance: float = 100.0
+    fy: float = 400.0
+    compression_reinforcement_tied: bool = False
+    tie_diameter: float = 3.65
+    tie_spacing: float = 200.0
+    horizontal_reinforcement_type: str = "None"
+    horizontal_bar_size: str = "10M"
+    horizontal_reinforcement_area: float = 0.0
+    horizontal_reinforcement_spacing: float = 200.0
+    horizontal_fy: float = 400.0
+    horizontal_anchorage_confirmed: bool = False
+    horizontal_continuity_confirmed: bool = False
+    horizontal_top_bar: bool = False
+    shear_method: str = "Use lower of simplified and general"
+    grout_type: str = "Coarse"
+    factored_axial: float = 200.0
+    factored_moment: float = 1000.0
+    factored_shear: float = 200.0
+    dead_load_compression: float | None = None
+    unfactored_dead_load_above: float = 150.0
+    include_wall_self_weight_in_pd: bool = True
+    masonry_density: float = 2100.0
+    grout_density: float = 2350.0
+    unit_solid_fraction: float = 0.56
+    sliding_friction: float = 1.0
+    sliding_plane: str = "Base/support joint"
+    uncracked_area_fraction: float = 0.5
+    vertical_bars_developed_at_base: bool = True
+    developed_vertical_bar_count: int | None = None
+    in_situ_grout_strength: float = 20.0
+    least_clear_cell_dimension: float = 100.0
+    epoxy_coated_vertical_bars: bool = False
+    available_vertical_development: float = 1200.0
+    available_horizontal_development: float = 600.0
+    splice_present: bool = False
+    splice_class: str = "B"
+    provided_lap_length: float = 1200.0
+    vertical_bars_continuous: bool = True
+    available_termination_extension: float = 5000.0
+    joint_wire_diameter: float = 3.65
+    mortar_joint_thickness: float = 10.0
+    base_connection_confirmed: bool = False
+    top_connection_confirmed: bool = False
+    oop_check_provided: bool = False
+    oop_utilization: float = 0.0
+    oop_stability_passed: bool = False
+
+
+@dataclass(frozen=True)
+class Segment:
+    x0: float
+    x1: float
+    effective_thickness: float
+    fm: float
+    grouted: bool
+
+
+@dataclass(frozen=True)
+class SectionProperties:
+    area: float
+    gross_area: float
+    centroid: float
+    inertia: float
+    section_modulus: float
+    weighted_fm: float
+    grout_fraction: float
+    grouted_length_fraction: float
+    gamma_g: float
+    bar_positions: tuple[float, ...]
+    bar_spacing: float | None
+    fm_ungrouted: float
+    fm_grouted: float
+    ft: float
+    segments: tuple[Segment, ...]
+
+
+@dataclass(frozen=True)
+class InteractionPoint:
+    p: float
+    m: float
+    c: float | None
+    branch: str
+
+
+@dataclass(frozen=True)
+class ShearResult:
+    effective_depth: float
+    moment_shear_ratio: float
+    beta: float | None
+    theta_degrees: float | None
+    masonry_resistance: float
+    steel_resistance: float
+    uncapped_resistance: float
+    maximum_resistance: float
+    resistance: float
+    required_horizontal_area: float | None
+    minimum_horizontal_area_2024: float | None
+    simplified_resistance: float | None
+    general_resistance: float | None
+    epsilon_x: float | None
+    ze: float | None
+    method: str
+
+
+@dataclass(frozen=True)
+class SlidingResult:
+    resistance: float
+    reinforced_route: float
+    bond_route: float | None
+    uncracked_area: float
+    required_dowel_area: float
+    developed_vertical_area: float
+    method: str
+
+
+@dataclass(frozen=True)
+class DetailingResult:
+    vertical_development_required: float
+    horizontal_development_required: float | None
+    lap_required: float | None
+    termination_extension_required: float
+    vertical_clearance_limit: float
+    vertical_bar_diameter: float
+    horizontal_bar_diameter: float | None
+
+
+@dataclass(frozen=True)
+class StabilityResult:
+    combined_utilization: float | None
+    oop_check_provided: bool
+    oop_stability_passed: bool
+
+
+@dataclass(frozen=True)
+class Check:
+    level: CheckLevel
+    title: str
+    detail: str
+    clause: str
+
+
+@dataclass(frozen=True)
+class TraceEntry:
+    variable: str
+    value: str
+    unit: str
+    equation: str
+    clause: str
+
+
+@dataclass(frozen=True)
+class WallResult:
+    wall: WallInput
+    section: SectionProperties
+    curve: tuple[InteractionPoint, ...]
+    alternate_curve: tuple[InteractionPoint, ...] | None
+    axial_cap: float
+    tension_cap: float
+    moment_resistance: float | None
+    alternate_moment_resistance: float | None
+    pm_utilization: float | None
+    shear: ShearResult
+    sliding: SlidingResult
+    detailing: DetailingResult
+    stability: StabilityResult
+    self_weight: float
+    pd: float
+    sliding_resistance: float
+    sliding_utilization: float | None
+    checks: tuple[Check, ...]
+    trace: tuple[TraceEntry, ...]
+
+
+class CalculationError(ValueError):
+    pass
+
+
+def beta_one(fm: float) -> float:
+    return 0.8 if fm <= 20.0 else 0.8 - 0.01 * (fm - 20.0)
+
+
+def _interpolate_strength(
+    strength: float,
+    values: dict[float, tuple[float, float]],
+) -> tuple[float, float]:
+    ordered = sorted(values.items())
+    if not ordered[0][0] <= strength <= ordered[-1][0]:
+        raise CalculationError("Nominal unit strength is outside the supported Table 4 range.")
+    for (x0, y0), (x1, y1) in zip(ordered, ordered[1:]):
+        if x0 <= strength <= x1:
+            fraction = (strength - x0) / (x1 - x0)
+            return tuple(a + fraction * (b - a) for a, b in zip(y0, y1))  # type: ignore[return-value]
+    return ordered[-1][1]
+
+
+def masonry_strengths(wall: WallInput) -> tuple[float, float]:
+    return _interpolate_strength(
+        wall.nominal_unit_strength,
+        _FM_TABLE[wall.edition][wall.mortar_type],
+    )
+
+
+def _validate(wall: WallInput) -> None:
+    positive = {
+        "length": wall.length,
+        "height": wall.height,
+        "thickness": wall.thickness,
+        "nominal unit strength": wall.nominal_unit_strength,
+        "face-shell thickness": wall.face_shell_thickness,
+        "horizontal reinforcement spacing": wall.horizontal_reinforcement_spacing,
+        "steel yield strength": wall.fy,
+        "horizontal steel yield strength": wall.horizontal_fy,
+        "in-situ grout strength": wall.in_situ_grout_strength,
+        "least clear cell dimension": wall.least_clear_cell_dimension,
+        "available vertical development": wall.available_vertical_development,
+        "available horizontal development": wall.available_horizontal_development,
+        "provided lap length": wall.provided_lap_length,
+        "masonry density": wall.masonry_density,
+        "grout density": wall.grout_density,
+    }
+    for name, value in positive.items():
+        if not math.isfinite(value) or value <= 0.0:
+            raise CalculationError(f"{name.capitalize()} must be positive and finite.")
+    for name, value in {
+        "factored moment": wall.factored_moment,
+        "factored shear": wall.factored_shear,
+        "unfactored dead load above wall": wall.unfactored_dead_load_above,
+        "horizontal reinforcement area": wall.horizontal_reinforcement_area,
+        "OOP utilization": wall.oop_utilization,
+        "available termination extension": wall.available_termination_extension,
+    }.items():
+        if not math.isfinite(value) or value < 0.0:
+            raise CalculationError(f"{name.capitalize()} must be non-negative and finite.")
+    if not math.isfinite(wall.factored_axial):
+        raise CalculationError("Factored axial load must be finite.")
+    if wall.dead_load_compression is not None and (
+        not math.isfinite(wall.dead_load_compression) or wall.dead_load_compression < 0.0
+    ):
+        raise CalculationError("Factored dead-load compression override must be non-negative and finite.")
+    if wall.edition not in _FM_TABLE:
+        raise CalculationError(f"Unsupported edition: {wall.edition}.")
+    if wall.mortar_type not in ("Type S", "Type N"):
+        raise CalculationError("Choose Type S or Type N mortar.")
+    if wall.bond_pattern not in ("Running bond", "Stack pattern"):
+        raise CalculationError("Choose running bond or stack pattern.")
+    if wall.unreinforced_condition not in _FT_TABLE:
+        raise CalculationError("Choose a supported unreinforced masonry condition.")
+    if wall.partial_grout_method not in (
+        "Discrete",
+        "Smeared",
+        "Use lower of discrete and smeared",
+    ):
+        raise CalculationError("Choose a supported partial-grout method.")
+    if wall.horizontal_reinforcement_type not in (
+        "None",
+        "Bond beam bars",
+        "Joint reinforcement",
+    ):
+        raise CalculationError("Choose a supported horizontal reinforcement type.")
+    if wall.shear_method not in (
+        "Simplified",
+        "General",
+        "Use lower of simplified and general",
+    ):
+        raise CalculationError("Choose a supported S304:24 shear method.")
+    if wall.grout_type not in ("Coarse", "Fine"):
+        raise CalculationError("Choose coarse or fine grout.")
+    if wall.sliding_plane not in ("Base/support joint", "Between masonry courses"):
+        raise CalculationError("Choose a supported sliding plane.")
+    if wall.wall_type not in (
+        "Unreinforced masonry",
+        "Fully grouted reinforced masonry",
+        "Partially grouted reinforced masonry",
+    ):
+        raise CalculationError(f"Unsupported wall type: {wall.wall_type}.")
+    if wall.face_shell_thickness * 2.0 >= wall.thickness:
+        raise CalculationError("Two face shells must leave a positive hollow core width.")
+    if not 0.0 < wall.sliding_friction <= 1.0:
+        raise CalculationError("Sliding friction must be greater than zero and no greater than 1.0.")
+    if wall.fy > 400.0:
+        raise CalculationError("This release limits reinforcement to fy <= 400 MPa.")
+    if wall.bar_size not in BAR_AREAS:
+        raise CalculationError(f"Unsupported vertical bar size: {wall.bar_size}.")
+    if wall.horizontal_bar_size not in BAR_AREAS:
+        raise CalculationError(f"Unsupported horizontal bar size: {wall.horizontal_bar_size}.")
+    if wall.wall_type != "Unreinforced masonry":
+        if wall.bar_count < 2:
+            raise CalculationError("A reinforced wall requires at least two vertical bars.")
+        if not 0.0 < wall.end_bar_distance < wall.length / 2.0:
+            raise CalculationError("End-bar distance must lie inside both ends of the wall.")
+    elif wall.factored_axial < 0.0:
+        raise CalculationError("Unreinforced masonry is not credited with concentric axial-tension resistance.")
+    if wall.wall_type == "Partially grouted reinforced masonry":
+        if not math.isfinite(wall.grouted_cell_width) or wall.grouted_cell_width <= 0.0:
+            raise CalculationError("Grouted-cell width must be positive and finite.")
+        spacing = (wall.length - 2.0 * wall.end_bar_distance) / (wall.bar_count - 1)
+        if wall.grouted_cell_width > spacing + 1.0e-9:
+            raise CalculationError("Grouted cells overlap; reduce their width or the bar count.")
+    if not 0.0 < wall.unit_solid_fraction <= 1.0:
+        raise CalculationError("Unit solid fraction must be greater than zero and no greater than 1.0.")
+    if not 0.0 <= wall.uncracked_area_fraction <= 1.0:
+        raise CalculationError("Uncracked area fraction must lie between zero and one.")
+    if wall.horizontal_reinforcement_type == "None" and wall.horizontal_reinforcement_area > 0.0:
+        raise CalculationError("Choose a horizontal reinforcement type when Av is non-zero.")
+    if wall.developed_vertical_bar_count is not None and not 0 <= wall.developed_vertical_bar_count <= wall.bar_count:
+        raise CalculationError("Developed vertical-bar count must be between zero and the total bar count.")
+    if wall.splice_class not in ("A", "B"):
+        raise CalculationError("Splice class must be A or B.")
+
+
+def _bar_positions(wall: WallInput) -> tuple[float, ...]:
+    if wall.wall_type == "Unreinforced masonry":
+        return ()
+    spacing = (wall.length - 2.0 * wall.end_bar_distance) / (wall.bar_count - 1)
+    return tuple(wall.end_bar_distance + i * spacing for i in range(wall.bar_count))
+
+
+def _partial_segments(
+    wall: WallInput,
+    fm_ungrouted: float,
+    fm_grouted: float,
+    positions: tuple[float, ...],
+) -> tuple[Segment, ...]:
+    half = wall.grouted_cell_width / 2.0
+    intervals = [
+        (max(0.0, x - half), min(wall.length, x + half))
+        for x in positions
+    ]
+    boundaries = sorted({0.0, wall.length, *(v for pair in intervals for v in pair)})
+    segments: list[Segment] = []
+    for x0, x1 in zip(boundaries, boundaries[1:]):
+        midpoint = (x0 + x1) / 2.0
+        grouted = any(a <= midpoint <= b for a, b in intervals)
+        segments.append(
+            Segment(
+                x0,
+                x1,
+                wall.thickness if grouted else 2.0 * wall.face_shell_thickness,
+                fm_grouted if grouted else fm_ungrouted,
+                grouted,
+            )
+        )
+    return tuple(segments)
+
+
+def section_properties(wall: WallInput, method: str | None = None) -> SectionProperties:
+    _validate(wall)
+    fm_ungrouted, fm_grouted = masonry_strengths(wall)
+    positions = _bar_positions(wall)
+    if wall.wall_type == "Fully grouted reinforced masonry":
+        discrete_segments = (Segment(0.0, wall.length, wall.thickness, fm_grouted, True),)
+    elif wall.wall_type == "Partially grouted reinforced masonry":
+        discrete_segments = _partial_segments(wall, fm_ungrouted, fm_grouted, positions)
+    else:
+        if wall.unreinforced_condition == "Hollow ungrouted":
+            discrete_segments = (
+                Segment(0.0, wall.length, 2.0 * wall.face_shell_thickness, fm_ungrouted, False),
+            )
+        else:
+            discrete_segments = (
+                Segment(0.0, wall.length, wall.thickness, fm_grouted, True),
+            )
+
+    discrete_area = sum(
+        (s.x1 - s.x0) * s.effective_thickness for s in discrete_segments
+    )
+    discrete_weighted_fm = sum(
+        s.fm * (s.x1 - s.x0) * s.effective_thickness for s in discrete_segments
+    ) / discrete_area
+    selected_method = method or (
+        "Smeared" if wall.partial_grout_method == "Smeared" else "Discrete"
+    )
+    if wall.wall_type == "Partially grouted reinforced masonry" and selected_method == "Smeared":
+        segments = (
+            Segment(
+                0.0,
+                wall.length,
+                discrete_area / wall.length,
+                discrete_weighted_fm,
+                False,
+            ),
+        )
+    else:
+        segments = discrete_segments
+
+    area = sum((s.x1 - s.x0) * s.effective_thickness for s in segments)
+    weighted_fm = sum(
+        s.fm * (s.x1 - s.x0) * s.effective_thickness for s in segments
+    ) / area
+    centroid = sum(
+        (s.x0 + s.x1) / 2.0 * (s.x1 - s.x0) * s.effective_thickness
+        for s in segments
+    ) / area
+    inertia = sum(
+        s.effective_thickness
+        * (
+            (s.x1 - s.x0) ** 3 / 12.0
+            + (s.x1 - s.x0) * ((s.x0 + s.x1) / 2.0 - centroid) ** 2
+        )
+        for s in segments
+    )
+    section_modulus = inertia / max(centroid, wall.length - centroid)
+    grouted_area = sum(
+        (s.x1 - s.x0) * s.effective_thickness for s in discrete_segments if s.grouted
+    )
+    grouted_length = sum(
+        s.x1 - s.x0 for s in discrete_segments if s.grouted
+    )
+    gross_area = wall.length * wall.thickness
+    grout_fraction = grouted_area / area
+    fully_grouted = wall.wall_type == "Fully grouted reinforced masonry" or (
+        wall.wall_type == "Unreinforced masonry"
+        and wall.unreinforced_condition in ("Fully grouted hollow", "Solid units")
+    )
+    gamma_g = 1.0 if fully_grouted else min(area / gross_area, 0.5)
+    bar_spacing = (
+        (wall.length - 2.0 * wall.end_bar_distance) / (wall.bar_count - 1)
+        if positions
+        else None
+    )
+    return SectionProperties(
+        area=area,
+        gross_area=gross_area,
+        centroid=centroid,
+        inertia=inertia,
+        section_modulus=section_modulus,
+        weighted_fm=weighted_fm,
+        grout_fraction=grout_fraction,
+        grouted_length_fraction=grouted_length / wall.length,
+        gamma_g=gamma_g,
+        bar_positions=positions,
+        bar_spacing=bar_spacing,
+        fm_ungrouted=fm_ungrouted,
+        fm_grouted=fm_grouted,
+        ft=_FT_TABLE[wall.unreinforced_condition][wall.mortar_type],
+        segments=segments,
+    )
+
+
+def _axial_cap(wall: WallInput, section: SectionProperties) -> float:
+    compression = sum(
+        0.85 * PHI_M * s.fm * (s.x1 - s.x0) * s.effective_thickness
+        for s in section.segments
+    )
+    if wall.compression_reinforcement_tied and section.bar_positions:
+        steel_area = len(section.bar_positions) * BAR_AREAS[wall.bar_size]
+        compression += steel_area * (
+            PHI_S * wall.fy - 0.85 * PHI_M * section.fm_grouted
+        )
+    return 0.80 * compression / 1000.0
+
+
+def _tension_cap(wall: WallInput, section: SectionProperties) -> float:
+    return (
+        PHI_S
+        * len(section.bar_positions)
+        * BAR_AREAS[wall.bar_size]
+        * wall.fy
+        / 1000.0
+    )
+
+
+def _wall_self_weight(wall: WallInput, section: SectionProperties) -> float:
+    gross_volume = wall.length * wall.height * wall.thickness * 1.0e-9
+    if wall.wall_type == "Unreinforced masonry" and wall.unreinforced_condition == "Solid units":
+        mass = gross_volume * wall.masonry_density
+    else:
+        unit_mass = gross_volume * wall.unit_solid_fraction * wall.masonry_density
+        grout_mass = (
+            gross_volume
+            * (1.0 - wall.unit_solid_fraction)
+            * section.grouted_length_fraction
+            * wall.grout_density
+        )
+        mass = unit_mass + grout_mass
+    return mass * 9.81 / 1000.0
+
+
+def _pd(wall: WallInput, self_weight: float) -> float:
+    if wall.dead_load_compression is not None:
+        return wall.dead_load_compression
+    dead = wall.unfactored_dead_load_above
+    if wall.include_wall_self_weight_in_pd:
+        dead += self_weight
+    return 0.9 * dead
+
+
+def _development_length(
+    wall: WallInput,
+    section: SectionProperties,
+    *,
+    horizontal: bool,
+) -> float | None:
+    if horizontal and wall.horizontal_reinforcement_type != "Bond beam bars":
+        return None
+    if horizontal and wall.horizontal_reinforcement_area <= 0.0:
+        return None
+    size = wall.bar_size
+    area, diameter = BAR_PROPERTIES[size]
+    fy = wall.fy
+    spacing = section.bar_spacing or wall.length
+    if horizontal:
+        area, diameter = BAR_PROPERTIES[wall.horizontal_bar_size]
+        fy = wall.horizontal_fy
+        spacing = wall.horizontal_reinforcement_spacing
+    if area <= 0.0 or diameter <= 0.0:
+        return None
+    dcs = min(wall.least_clear_cell_dimension / 2.0, 2.0 * spacing / 3.0)
+    transverse_index = 0.0
+    if not horizontal and wall.horizontal_reinforcement_type != "None" and wall.horizontal_anchorage_confirmed:
+        transverse_index = (
+            wall.horizontal_reinforcement_area
+            * min(wall.horizontal_fy, 400.0)
+            / (10.5 * wall.horizontal_reinforcement_spacing)
+        )
+    denominator = min(dcs + transverse_index, 2.5 * diameter)
+    k1 = 1.3 if horizontal and wall.horizontal_top_bar else 1.0
+    if wall.epoxy_coated_vertical_bars and not horizontal:
+        clear_cover = max((wall.least_clear_cell_dimension - diameter) / 2.0, 0.0)
+        k2 = 1.5 if clear_cover < 3.0 * diameter else 1.2
+    else:
+        k2 = 1.0
+    k3 = 0.8 if diameter <= 20.0 else 1.0
+    return max(
+        1.15
+        * min(k1 * k2, 1.7)
+        * k3
+        * fy
+        * area
+        / (denominator * math.sqrt(wall.in_situ_grout_strength)),
+        300.0,
+    )
+
+
+def _detailing_result(
+    wall: WallInput,
+    section: SectionProperties,
+) -> DetailingResult:
+    vertical_ld = _development_length(wall, section, horizontal=False) or 0.0
+    horizontal_ld = _development_length(wall, section, horizontal=True)
+    lap_required = (
+        max(300.0, vertical_ld * (1.0 if wall.splice_class == "A" else 1.3))
+        if wall.splice_present
+        else None
+    )
+    _, vertical_diameter = BAR_PROPERTIES[wall.bar_size]
+    horizontal_diameter = None
+    if wall.horizontal_reinforcement_type == "Joint reinforcement":
+        horizontal_diameter = wall.joint_wire_diameter
+    elif wall.horizontal_reinforcement_type == "Bond beam bars" and wall.horizontal_reinforcement_area > 0.0:
+        horizontal_diameter = BAR_PROPERTIES[wall.horizontal_bar_size][1]
+    extreme_depth = max(section.bar_positions) if section.bar_positions else 0.0
+    return DetailingResult(
+        vertical_development_required=vertical_ld,
+        horizontal_development_required=horizontal_ld,
+        lap_required=lap_required,
+        termination_extension_required=max(extreme_depth, 12.0 * vertical_diameter),
+        vertical_clearance_limit=wall.least_clear_cell_dimension / 2.0,
+        vertical_bar_diameter=vertical_diameter,
+        horizontal_bar_diameter=horizontal_diameter,
+    )
+
+
+def section_point_at_c(
+    wall: WallInput,
+    neutral_axis: float,
+    section: SectionProperties | None = None,
+) -> InteractionPoint:
+    """Return the strain-compatible strong-axis resistance at one neutral axis."""
+
+    section = section or section_properties(wall)
+    if neutral_axis <= 0.0 or not math.isfinite(neutral_axis):
+        raise CalculationError("Neutral-axis depth must be positive and finite.")
+
+    compression_force = 0.0
+    moment_nmm = 0.0
+    for segment in section.segments:
+        block_end = min(segment.x1, beta_one(segment.fm) * neutral_axis)
+        if block_end <= segment.x0:
+            continue
+        width = block_end - segment.x0
+        force = 0.85 * PHI_M * segment.fm * segment.effective_thickness * width
+        x = (segment.x0 + block_end) / 2.0
+        compression_force += force
+        moment_nmm += force * (section.centroid - x)
+
+    tension: list[tuple[float, float]] = []
+    compression_steel_force = 0.0
+    compression_steel_moment = 0.0
+    bar_area = BAR_AREAS[wall.bar_size]
+    for position in section.bar_positions:
+        strain = EPS_MU * (position - neutral_axis) / neutral_axis
+        if strain > 0.0:
+            stress = min(wall.fy, E_S * strain)
+            force = PHI_S * bar_area * stress
+            tension.append((position, force))
+        elif wall.compression_reinforcement_tied:
+            stress = min(wall.fy, E_S * abs(strain))
+            force = PHI_S * bar_area * stress
+            if position <= beta_one(section.fm_grouted) * neutral_axis:
+                force = max(
+                    0.0,
+                    force - 0.85 * PHI_M * section.fm_grouted * bar_area,
+                )
+            compression_steel_force += force
+            compression_steel_moment += force * (section.centroid - position)
+
+    squat = wall.height / wall.length < 1.0 and bool(tension)
+    if squat:
+        design_depth = min(0.67 * wall.length, 0.70 * wall.height)
+        if wall.edition == "S304:24":
+            tensile_centroid = sum(x for x, _ in tension) / len(tension)
+            design_depth = min(design_depth, tensile_centroid)
+    else:
+        design_depth = None
+
+    tension_force = 0.0
+    normal_moment = moment_nmm + compression_steel_moment
+    reduced_moment = moment_nmm + compression_steel_moment
+    for position, force in tension:
+        tension_force += force
+        normal_moment += force * (position - section.centroid)
+        reduced_moment += force * (
+            (design_depth if design_depth is not None else position)
+            - section.centroid
+        )
+
+    moment_nmm = min(normal_moment, reduced_moment) if squat else normal_moment
+    axial_force = compression_force + compression_steel_force - tension_force
+    branch = "reinforced" if tension else "compression-only"
+    if not tension and axial_force > 0.0:
+        moment_nmm = min(
+            moment_nmm,
+            axial_force * ECCENTRICITY_LIMIT * wall.length,
+        )
+    return InteractionPoint(
+        p=axial_force / 1000.0,
+        m=max(moment_nmm, 0.0) / 1_000_000.0,
+        c=neutral_axis,
+        branch=branch,
+    )
+
+
+def _interpolate_point(
+    before: InteractionPoint,
+    after: InteractionPoint,
+    target_p: float,
+    branch: str | None = None,
+) -> InteractionPoint:
+    fraction = (target_p - before.p) / (after.p - before.p)
+    c = None
+    if before.c is not None and after.c is not None:
+        c = before.c + fraction * (after.c - before.c)
+    return InteractionPoint(
+        p=target_p,
+        m=before.m + fraction * (after.m - before.m),
+        c=c,
+        branch=branch or before.branch,
+    )
+
+
+def _reinforced_curve(
+    wall: WallInput,
+    section: SectionProperties,
+    samples: int,
+) -> tuple[tuple[InteractionPoint, ...], float]:
+    cap = _axial_cap(wall, section)
+    tension_cap = _tension_cap(wall, section)
+    c_max = wall.length / min(beta_one(s.fm) for s in section.segments)
+    raw = [
+        section_point_at_c(wall, max(1.0e-6, c_max * i / samples), section)
+        for i in range(1, samples + 1)
+    ]
+    curve: list[InteractionPoint] = [
+        InteractionPoint(-tension_cap, 0.0, 0.0, "tension-cap")
+    ]
+    for point in raw:
+        if point.p < -tension_cap:
+            continue
+        if point.p <= cap:
+            curve.append(point)
+            continue
+        if curve and curve[-1].p < cap:
+            curve.append(_interpolate_point(curve[-1], point, cap, "axial-cap"))
+        break
+    if not curve:
+        raise CalculationError("The reinforced P-M curve could not be generated.")
+    if curve[-1].p < cap:
+        last = curve[-1]
+        curve.append(InteractionPoint(cap, last.m, last.c, "axial-cap"))
+    curve.append(InteractionPoint(cap, 0.0, None, "axial-cap"))
+    return tuple(curve), cap
+
+
+def _unreinforced_curve(
+    wall: WallInput,
+    section: SectionProperties,
+    samples: int,
+) -> tuple[tuple[InteractionPoint, ...], float]:
+    cap = _axial_cap(wall, section)
+    segment = section.segments[0]
+    stress = 0.85 * PHI_M * segment.fm
+    curve: list[InteractionPoint] = []
+    for index in range(samples + 1):
+        p = cap * index / samples
+        p_n = p * 1000.0
+        compression_limit = (
+            0.60 * PHI_M * segment.fm - p_n / section.area
+        ) * section.section_modulus
+        tension_limit = (
+            PHI_M * section.ft + p_n / section.area
+        ) * section.section_modulus
+        uncracked = max(0.0, min(compression_limit, tension_limit))
+        if p_n == 0.0:
+            cracked = 0.0
+            c = 0.0
+        else:
+            block_depth = p_n / (stress * segment.effective_thickness)
+            c = block_depth / beta_one(segment.fm)
+            raw = p_n * (section.centroid - block_depth / 2.0)
+            cracked = min(raw, p_n * ECCENTRICITY_LIMIT * wall.length)
+        if uncracked >= cracked:
+            moment = uncracked
+            branch = "uncracked"
+        else:
+            moment = cracked
+            branch = "cracked"
+        curve.append(InteractionPoint(p, moment / 1_000_000.0, c, branch))
+    curve.append(InteractionPoint(cap, 0.0, None, "axial-cap"))
+    return tuple(curve), cap
+
+
+def interaction_curve(
+    wall: WallInput,
+    section: SectionProperties | None = None,
+    samples: int = 1200,
+) -> tuple[tuple[InteractionPoint, ...], float]:
+    if samples < 100:
+        raise CalculationError("At least 100 interaction samples are required.")
+    section = section or section_properties(wall)
+    if wall.wall_type == "Unreinforced masonry":
+        return _unreinforced_curve(wall, section, samples)
+    return _reinforced_curve(wall, section, samples)
+
+
+def moment_at_axial_load(
+    curve: tuple[InteractionPoint, ...],
+    axial_load: float,
+) -> float | None:
+    candidates = [p.m for p in curve if abs(p.p - axial_load) <= 1.0e-8]
+    for before, after in zip(curve, curve[1:]):
+        if min(before.p, after.p) <= axial_load <= max(before.p, after.p):
+            if abs(after.p - before.p) <= 1.0e-12:
+                candidates.extend((before.m, after.m))
+            else:
+                candidates.append(_interpolate_point(before, after, axial_load).m)
+    return max(candidates) if candidates else None
+
+
+def _shear_result(
+    wall: WallInput,
+    section: SectionProperties,
+    pd_kN: float,
+) -> ShearResult:
+    dv = 0.8 * wall.length
+    if wall.factored_shear > 0.0:
+        ratio = wall.factored_moment * 1_000_000.0 / (
+            wall.factored_shear * 1000.0 * dv
+        )
+        ratio = min(1.0, max(0.25, ratio))
+    else:
+        ratio = 1.0
+    fm = section.weighted_fm
+    gamma = section.gamma_g
+    pd = pd_kN * 1000.0
+    provided_av = (
+        wall.horizontal_reinforcement_area
+        if wall.horizontal_reinforcement_type != "None"
+        else 0.0
+    )
+    av = provided_av if wall.horizontal_anchorage_confirmed else 0.0
+    spacing = wall.horizontal_reinforcement_spacing
+    horizontal_fy = wall.horizontal_fy
+    reinforced = wall.wall_type != "Unreinforced masonry"
+
+    beta: float | None = None
+    theta: float | None = None
+    minimum_av_2024: float | None = None
+    simplified_resistance: float | None = None
+    general_resistance: float | None = None
+    epsilon_x: float | None = None
+    ze: float | None = None
+    if wall.edition == "S304:24" and reinforced:
+        minimum_av_2024 = 0.35 * wall.thickness * spacing / horizontal_fy
+
+        def capacity(beta_value: float, theta_value: float) -> tuple[float, float, float, float, float]:
+            masonry_value = (
+                PHI_M
+                * beta_value
+                * math.sqrt(fm)
+                * wall.thickness
+                * dv
+                * gamma
+            )
+            lever_value = min(
+                dv / math.tan(math.radians(theta_value)),
+                wall.height,
+            )
+            steel_value = PHI_S * av * horizontal_fy * lever_value / spacing
+            uncapped_value = masonry_value + steel_value
+            maximum_value = 0.25 * PHI_M * fm * wall.thickness * dv * gamma
+            return (
+                min(uncapped_value, maximum_value),
+                masonry_value,
+                steel_value,
+                maximum_value,
+                lever_value,
+            )
+
+        if wall.wall_type == "Partially grouted reinforced masonry":
+            beta_simplified = beta_general = 0.16 * (2.0 - ratio) + 0.25 * pd / (
+                math.sqrt(fm) * wall.thickness * dv
+            )
+            theta_simplified = theta_general = 59.0
+        else:
+            beta_simplified = (
+                0.18
+                if av >= minimum_av_2024
+                else 230.0 / (1000.0 + 1.4 * dv)
+            )
+            theta_simplified = 42.0
+            candidate_zs = min(dv, section.bar_spacing or dv)
+            vertical_area = BAR_AREAS[wall.bar_size]
+            zs = (
+                candidate_zs
+                if vertical_area >= 0.002 * wall.thickness * candidate_zs
+                else dv
+            )
+            ze = (
+                300.0
+                if av >= minimum_av_2024
+                else (1.4 if wall.grout_type == "Coarse" else 1.7) * zs
+            )
+            tension_half_area = BAR_AREAS[wall.bar_size] * sum(
+                position >= section.centroid for position in section.bar_positions
+            )
+            design_moment = max(
+                wall.factored_moment * 1_000_000.0,
+                wall.factored_shear * 1000.0 * dv,
+            )
+            axial_n = -wall.factored_axial * 1000.0
+            epsilon_x = (
+                (design_moment / dv + wall.factored_shear * 1000.0 + 0.5 * axial_n)
+                / (2.0 * E_S * tension_half_area)
+                if tension_half_area > 0.0
+                else 0.003
+            )
+            epsilon_x = min(0.003, max(0.0, epsilon_x))
+            if wall.factored_axial < 0.0:
+                epsilon_x = min(0.003, 2.0 * epsilon_x)
+            beta_general = 0.40 / (1.0 + 1500.0 * epsilon_x) * 1300.0 / (1000.0 + ze)
+            theta_general = 29.0 + 7000.0 * epsilon_x
+
+        simplified = capacity(beta_simplified, theta_simplified)
+        general = capacity(beta_general, theta_general)
+        simplified_resistance = simplified[0] / 1000.0
+        general_resistance = general[0] / 1000.0
+        if wall.factored_axial < 0.0:
+            selected = general
+            beta, theta = beta_general, theta_general
+            method = "S304:24 general route required by axial tension"
+        elif wall.shear_method == "Simplified":
+            selected = simplified
+            beta, theta = beta_simplified, theta_simplified
+            method = "S304:24 simplified modified-compression-field route"
+        elif wall.shear_method == "General":
+            selected = general
+            beta, theta = beta_general, theta_general
+            method = "S304:24 general modified-compression-field route"
+        elif simplified[0] <= general[0]:
+            selected = simplified
+            beta, theta = beta_simplified, theta_simplified
+            method = "Lower S304:24 route: simplified"
+        else:
+            selected = general
+            beta, theta = beta_general, theta_general
+            method = "Lower S304:24 route: general"
+        resistance, masonry, steel, maximum, lever = selected
+        uncapped = masonry + steel
+        required = max(
+            0.0,
+            (wall.factored_shear * 1000.0 - masonry)
+            * spacing
+            / (PHI_S * horizontal_fy * lever),
+        )
+    else:
+        if wall.edition == "S304:24":
+            vm = 0.16 * (2.0 - ratio)  # Clause 8.10.2.3 omits sqrt(f'm).
+            method = "S304:24 unreinforced shear route"
+        else:
+            vm = 0.16 * (2.0 - ratio) * math.sqrt(fm)
+            method = "S304-14 in-plane shear route"
+        masonry = PHI_M * (vm * wall.thickness * dv + 0.25 * pd) * gamma
+        steel = (
+            0.60 * PHI_S * av * horizontal_fy * dv / spacing if reinforced else 0.0
+        )
+        uncapped = masonry + steel
+        aspect = min(1.0, max(0.5, wall.height / wall.length))
+        squat_factor = 2.0 - aspect if wall.height / wall.length < 1.0 else 1.0
+        maximum = (
+            0.40
+            * PHI_M
+            * math.sqrt(fm)
+            * wall.thickness
+            * dv
+            * gamma
+            * squat_factor
+        )
+        resistance = min(uncapped, maximum)
+        required = (
+            max(
+                0.0,
+                (wall.factored_shear * 1000.0 - masonry)
+                * spacing
+                / (0.60 * PHI_S * horizontal_fy * dv),
+            )
+            if reinforced
+            else None
+        )
+    if wall.bond_pattern == "Stack pattern":
+        ch = PHI_S * av * horizontal_fy
+        stack_limit = (PHI_M * 0.7 if wall.edition == "S304-14" else 1.0) * ch
+        maximum = min(maximum, stack_limit)
+        resistance = min(resistance, maximum)
+        method += "; stack-pattern head-joint limit"
+    return ShearResult(
+        effective_depth=dv,
+        moment_shear_ratio=ratio,
+        beta=beta,
+        theta_degrees=theta,
+        masonry_resistance=masonry / 1000.0,
+        steel_resistance=steel / 1000.0,
+        uncapped_resistance=uncapped / 1000.0,
+        maximum_resistance=maximum / 1000.0,
+        resistance=resistance / 1000.0,
+        required_horizontal_area=required,
+        minimum_horizontal_area_2024=minimum_av_2024,
+        simplified_resistance=simplified_resistance,
+        general_resistance=general_resistance,
+        epsilon_x=epsilon_x,
+        ze=ze,
+        method=method,
+    )
+
+
+def _sliding_result(
+    wall: WallInput,
+    section: SectionProperties,
+    pd_kN: float,
+) -> SlidingResult:
+    developed_count = 0
+    if wall.wall_type != "Unreinforced masonry" and wall.vertical_bars_developed_at_base:
+        developed_count = (
+            wall.developed_vertical_bar_count
+            if wall.developed_vertical_bar_count is not None
+            else len(section.bar_positions)
+        )
+    developed_area = developed_count * BAR_AREAS[wall.bar_size]
+    pd = pd_kN * 1000.0
+    clamping = pd + PHI_S * developed_area * wall.fy
+    edition_factor = PHI_M if wall.edition == "S304-14" else 1.0
+    reinforced_route = edition_factor * wall.sliding_friction * clamping
+    uncracked_area = wall.uncracked_area_fraction * section.area
+    bond_route: float | None = None
+    if wall.sliding_plane == "Between masonry courses":
+        bond_route = (
+            0.16 * PHI_M * math.sqrt(section.weighted_fm) * uncracked_area
+            + edition_factor * wall.sliding_friction * pd
+        )
+        resistance = max(reinforced_route, bond_route)
+        method = "greater of separate reinforced-friction and uncracked-bond routes"
+    else:
+        resistance = reinforced_route
+        method = "support-joint shear friction"
+    required_area = 0.0
+    if bond_route is None or bond_route < wall.factored_shear * 1000.0:
+        required_area = max(
+            0.0,
+            (
+                wall.factored_shear * 1000.0
+                / (edition_factor * wall.sliding_friction)
+                - pd
+            )
+            / (PHI_S * wall.fy),
+        )
+    return SlidingResult(
+        resistance=resistance / 1000.0,
+        reinforced_route=reinforced_route / 1000.0,
+        bond_route=None if bond_route is None else bond_route / 1000.0,
+        uncracked_area=uncracked_area,
+        required_dowel_area=required_area,
+        developed_vertical_area=developed_area,
+        method=method,
+    )
+
+
+def _checks(
+    wall: WallInput,
+    section: SectionProperties,
+    axial_cap: float,
+    tension_cap: float,
+    moment_resistance: float | None,
+    shear: ShearResult,
+    sliding: SlidingResult,
+    detailing: DetailingResult,
+    stability: StabilityResult,
+    self_weight: float,
+    pd: float,
+) -> tuple[Check, ...]:
+    checks: list[Check] = []
+
+    def add(ok: bool, title: str, detail: str, clause: str) -> None:
+        checks.append(Check("pass" if ok else "blocked", title, detail, clause))
+
+    flex_clause = "10.2 / 10.4" if wall.edition == "S304-14" else "11.2 / 11.4"
+    if wall.factored_axial >= 0.0:
+        add(
+            wall.factored_axial <= axial_cap + 1.0e-8,
+            "Maximum compression resistance",
+            f"Pf = {wall.factored_axial:.2f} kN; Pr,max = {axial_cap:.2f} kN.",
+            flex_clause,
+        )
+    else:
+        add(
+            -wall.factored_axial <= tension_cap + 1.0e-8,
+            "Maximum axial-tension resistance",
+            f"|Pf| = {-wall.factored_axial:.2f} kN; Tr,max = {tension_cap:.2f} kN.",
+            flex_clause,
+        )
+    add(
+        moment_resistance is not None
+        and wall.factored_moment <= moment_resistance + 1.0e-8,
+        "Axial load plus in-plane moment",
+        (
+            f"Mf = {wall.factored_moment:.2f} kN-m; "
+            + (
+                f"Mr(Pf) = {moment_resistance:.2f} kN-m."
+                if moment_resistance is not None
+                else "no resistance is defined at this axial load."
+            )
+        ),
+        flex_clause,
+    )
+    shear_clause = "7.10 / 10.10" if wall.edition == "S304-14" else "8.10 / 11.10"
+    add(
+        wall.factored_shear <= shear.resistance + 1.0e-8,
+        "Diagonal shear",
+        f"Vf = {wall.factored_shear:.2f} kN; Vr = {shear.resistance:.2f} kN.",
+        shear_clause,
+    )
+    add(
+        wall.factored_shear <= sliding.resistance + 1.0e-8,
+        "Sliding shear",
+        f"Vf = {wall.factored_shear:.2f} kN; Vr,slide = {sliding.resistance:.2f} kN ({sliding.method}).",
+        ("10.10.5.1" if wall.edition == "S304-14" else "11.10.5.1")
+        if wall.wall_type != "Unreinforced masonry"
+        else ("7.10.5.1" if wall.edition == "S304-14" else "8.10.5"),
+    )
+
+    if wall.wall_type != "Unreinforced masonry":
+        assert section.bar_spacing is not None
+        area = BAR_AREAS[wall.bar_size]
+        minimum = 0.00125 * wall.thickness * min(
+            section.bar_spacing, 4.0 * wall.thickness
+        )
+        add(
+            area >= minimum - 1.0e-8,
+            "Minimum vertical reinforcement",
+            f"As,bar = {area:.1f} mm2; minimum = {minimum:.1f} mm2 at s = {section.bar_spacing:.1f} mm.",
+            "10.15.1.1" if wall.edition == "S304-14" else "11.15.1.1",
+        )
+        ratio = area / (
+            wall.thickness * min(section.bar_spacing, 4.0 * wall.thickness)
+        )
+        add(
+            ratio <= 0.02 + 1.0e-12,
+            "Maximum vertical reinforcement",
+            f"Vertical steel ratio = {100.0 * ratio:.3f}%; limit = 2.000%.",
+            "10.15.2" if wall.edition == "S304-14" else "11.15.2",
+        )
+        add(
+            section.bar_spacing <= 2400.0 + 1.0e-8,
+            "Maximum vertical-bar spacing",
+            f"s_v = {section.bar_spacing:.1f} mm; limit = 2400 mm.",
+            "10.15.1.2" if wall.edition == "S304-14" else "11.15.1.2",
+        )
+        add(
+            wall.end_bar_distance <= 200.0 + 1.0e-8,
+            "Vertical reinforcement at wall ends",
+            f"End-bar distance = {wall.end_bar_distance:.1f} mm; the supported end-cell limit is 200 mm.",
+            "10.15.1.2" if wall.edition == "S304-14" else "11.15.1.2",
+        )
+        add(
+            detailing.vertical_bar_diameter <= detailing.vertical_clearance_limit + 1.0e-8,
+            "Vertical bar fit in masonry cell",
+            f"Bar diameter = {detailing.vertical_bar_diameter:.1f} mm; limit = {detailing.vertical_clearance_limit:.1f} mm.",
+            "12.1.3" if wall.edition == "S304-14" else "13.1.3",
+        )
+        add(
+            wall.available_vertical_development >= detailing.vertical_development_required - 1.0e-8,
+            "Vertical-bar development at critical section",
+            f"Available = {wall.available_vertical_development:.0f} mm; required = {detailing.vertical_development_required:.0f} mm.",
+            "12.4.2.3" if wall.edition == "S304-14" else "13.4.2.3",
+        )
+        if wall.splice_present and detailing.lap_required is not None:
+            add(
+                wall.provided_lap_length >= detailing.lap_required - 1.0e-8,
+                f"Class {wall.splice_class} tension lap splice",
+                f"Provided = {wall.provided_lap_length:.0f} mm; required = {detailing.lap_required:.0f} mm.",
+                "12.5.4.2" if wall.edition == "S304-14" else "13.5.4.2",
+            )
+        add(
+            wall.vertical_bars_continuous
+            or wall.available_termination_extension >= detailing.termination_extension_required - 1.0e-8,
+            "Vertical-bar continuity or termination extension",
+            (
+                "Bars are continuous over the wall height."
+                if wall.vertical_bars_continuous
+                else f"Available extension = {wall.available_termination_extension:.0f} mm; required = {detailing.termination_extension_required:.0f} mm."
+            ),
+            "12.4.8.3" if wall.edition == "S304-14" else "13.4.8.3",
+        )
+        if wall.compression_reinforcement_tied:
+            _, longitudinal_diameter = BAR_PROPERTIES[wall.bar_size]
+            tie_limit = min(
+                16.0 * longitudinal_diameter,
+                48.0 * wall.tie_diameter,
+                wall.thickness,
+            )
+            add(
+                wall.tie_diameter >= 3.65 - 1.0e-8 and wall.tie_spacing <= tie_limit + 1.0e-8,
+                "Compression-reinforcement ties",
+                f"Tie diameter = {wall.tie_diameter:.2f} mm (minimum 3.65); spacing = {wall.tie_spacing:.0f} mm (limit {tie_limit:.0f}).",
+                "12.2.1" if wall.edition == "S304-14" else "13.2.1",
+            )
+
+        if wall.horizontal_reinforcement_type == "Bond beam bars":
+            maximum_spacing = min(2400.0, 0.5 * wall.length)
+            if wall.edition == "S304:24":
+                maximum_spacing = min(maximum_spacing, 0.5 * wall.height)
+        elif wall.horizontal_reinforcement_type == "Joint reinforcement":
+            maximum_spacing = 600.0
+        else:
+            maximum_spacing = math.inf
+        if wall.horizontal_reinforcement_type != "None":
+            horizontal_ratio = wall.horizontal_reinforcement_area / (
+                wall.thickness * wall.horizontal_reinforcement_spacing
+            )
+            add(
+                horizontal_ratio <= 0.02 + 1.0e-12,
+                "Maximum horizontal reinforcement",
+                f"Horizontal steel ratio = {100.0 * horizontal_ratio:.3f}%; limit = 2.000%.",
+                "10.15.2" if wall.edition == "S304-14" else "11.15.2",
+            )
+            add(
+                wall.horizontal_reinforcement_spacing <= maximum_spacing + 1.0e-8,
+                "Horizontal shear-reinforcement spacing",
+                f"Type = {wall.horizontal_reinforcement_type}; s = {wall.horizontal_reinforcement_spacing:.1f} mm; limit = {maximum_spacing:.1f} mm.",
+                "10.15.1.4" if wall.edition == "S304-14" else "11.15.1.4",
+            )
+            add(
+                wall.horizontal_anchorage_confirmed,
+                "Horizontal shear-reinforcement anchorage",
+                "Anchorage at both wall ends is confirmed." if wall.horizontal_anchorage_confirmed else "Horizontal steel is not credited until anchorage at both wall ends is confirmed.",
+                "12.4.11" if wall.edition == "S304-14" else "13.4.11",
+            )
+            add(
+                wall.horizontal_continuity_confirmed,
+                "Horizontal reinforcement continuity",
+                "Continuity along the wall and at the top connection is confirmed." if wall.horizontal_continuity_confirmed else "Continuity along the wall and at the top connection has not been confirmed.",
+                "10.15.1.4" if wall.edition == "S304-14" else "11.15.1.4",
+            )
+            if wall.horizontal_reinforcement_type == "Bond beam bars" and detailing.horizontal_development_required is not None:
+                add(
+                    detailing.horizontal_bar_diameter is not None
+                    and detailing.horizontal_bar_diameter <= detailing.vertical_clearance_limit + 1.0e-8,
+                    "Bond-beam bar fit in masonry space",
+                    f"Bar diameter = {detailing.horizontal_bar_diameter:.1f} mm; limit = {detailing.vertical_clearance_limit:.1f} mm.",
+                    "12.1.3" if wall.edition == "S304-14" else "13.1.3",
+                )
+                add(
+                    wall.horizontal_reinforcement_area >= BAR_AREAS[wall.horizontal_bar_size] - 1.0e-8,
+                    "Bond-beam reinforcement area",
+                    f"Provided Av = {wall.horizontal_reinforcement_area:.1f} mm2; one {wall.horizontal_bar_size} bar requires {BAR_AREAS[wall.horizontal_bar_size]:.1f} mm2.",
+                    "Reinforcement layout",
+                )
+                add(
+                    wall.available_horizontal_development >= detailing.horizontal_development_required - 1.0e-8,
+                    "Bond-beam-bar development",
+                    f"Available = {wall.available_horizontal_development:.0f} mm; required = {detailing.horizontal_development_required:.0f} mm.",
+                    "12.4.2.3" if wall.edition == "S304-14" else "13.4.2.3",
+                )
+            if wall.horizontal_reinforcement_type == "Joint reinforcement":
+                joint_limit = min(5.0, wall.mortar_joint_thickness / 2.0)
+                add(
+                    3.0 <= wall.joint_wire_diameter <= joint_limit + 1.0e-8,
+                    "Joint-reinforcement wire diameter",
+                    f"Diameter = {wall.joint_wire_diameter:.2f} mm; permitted range = 3.0 to {joint_limit:.2f} mm.",
+                    "12.1.4" if wall.edition == "S304-14" else "13.1.4",
+                )
+        elif shear.required_horizontal_area is not None and shear.required_horizontal_area > 1.0e-8:
+            add(
+                False,
+                "Required horizontal shear reinforcement",
+                f"Av = {shear.required_horizontal_area:.1f} mm2 is required at s = {wall.horizontal_reinforcement_spacing:.0f} mm, but no reinforcement type is selected.",
+                "10.10.2.1" if wall.edition == "S304-14" else "11.10.2.1",
+            )
+
+    if wall.wall_type == "Unreinforced masonry" and wall.horizontal_reinforcement_type != "None":
+        unreinforced_horizontal_ratio = wall.horizontal_reinforcement_area / (
+            wall.thickness * wall.horizontal_reinforcement_spacing
+        )
+        add(
+            unreinforced_horizontal_ratio <= 0.02 + 1.0e-12,
+            "Maximum horizontal reinforcement",
+            f"Horizontal steel ratio = {100.0 * unreinforced_horizontal_ratio:.3f}%; limit = 2.000%.",
+            "7.10.4" if wall.edition == "S304-14" else "8.10.4",
+        )
+        unreinforced_h_limit = (
+            600.0
+            if wall.horizontal_reinforcement_type == "Joint reinforcement"
+            else min(
+                2400.0,
+                0.5 * wall.length,
+                0.5 * wall.height if wall.edition == "S304:24" else math.inf,
+            )
+        )
+        add(
+            wall.horizontal_reinforcement_spacing <= unreinforced_h_limit + 1.0e-8,
+            "Horizontal reinforcement spacing",
+            f"Type = {wall.horizontal_reinforcement_type}; s = {wall.horizontal_reinforcement_spacing:.1f} mm; limit = {unreinforced_h_limit:.1f} mm.",
+            "7.10.4" if wall.edition == "S304-14" else "8.10.4",
+        )
+        add(
+            wall.horizontal_anchorage_confirmed and wall.horizontal_continuity_confirmed,
+            "Horizontal reinforcement continuity and anchorage",
+            "Continuity and anchorage are confirmed." if wall.horizontal_anchorage_confirmed and wall.horizontal_continuity_confirmed else "Confirm continuity and anchorage before relying on horizontal reinforcement.",
+            "7.10.4" if wall.edition == "S304-14" else "8.10.4",
+        )
+        if wall.horizontal_reinforcement_type == "Bond beam bars" and detailing.horizontal_development_required is not None:
+            add(
+                detailing.horizontal_bar_diameter is not None
+                and detailing.horizontal_bar_diameter <= detailing.vertical_clearance_limit + 1.0e-8,
+                "Bond-beam bar fit in masonry space",
+                f"Bar diameter = {detailing.horizontal_bar_diameter:.1f} mm; limit = {detailing.vertical_clearance_limit:.1f} mm.",
+                "12.1.3" if wall.edition == "S304-14" else "13.1.3",
+            )
+            add(
+                wall.available_horizontal_development >= detailing.horizontal_development_required - 1.0e-8,
+                "Bond-beam-bar development",
+                f"Available = {wall.available_horizontal_development:.0f} mm; required = {detailing.horizontal_development_required:.0f} mm.",
+                "12.4.2.3" if wall.edition == "S304-14" else "13.4.2.3",
+            )
+        if wall.horizontal_reinforcement_type == "Joint reinforcement":
+            joint_limit = min(5.0, wall.mortar_joint_thickness / 2.0)
+            add(
+                3.0 <= wall.joint_wire_diameter <= joint_limit + 1.0e-8,
+                "Joint-reinforcement wire diameter",
+                f"Diameter = {wall.joint_wire_diameter:.2f} mm; permitted range = 3.0 to {joint_limit:.2f} mm.",
+                "12.1.4" if wall.edition == "S304-14" else "13.1.4",
+            )
+
+    if wall.bond_pattern == "Stack pattern":
+        add(
+            wall.horizontal_reinforcement_type != "None"
+            and wall.horizontal_anchorage_confirmed
+            and wall.horizontal_continuity_confirmed,
+            "Stack-pattern head-joint reinforcement",
+            "Continuous developed horizontal reinforcement is required across every continuous head joint.",
+            "10.10.4" if wall.edition == "S304-14" else "11.10.4",
+        )
+
+    if wall.wall_type == "Partially grouted reinforced masonry":
+        add(
+            wall.unit_geometry_confirmed,
+            "Partial-grout unit geometry",
+            "Face-shell thickness, cell width, mortar-bedded area, and grout layout are confirmed." if wall.unit_geometry_confirmed else "Confirm face-shell thickness, cell width, mortar-bedded area, and grout layout.",
+            "Table 4 Notes 2-3" if wall.edition == "S304-14" else "Table 4 Note 3",
+        )
+
+    add(
+        wall.base_connection_confirmed,
+        "Wall-to-foundation connection",
+        "Base force transfer and reinforcement continuity are confirmed." if wall.base_connection_confirmed else "Confirm base force transfer, dowels, development, and foundation interface details.",
+        "Wall-level connection",
+    )
+    add(
+        wall.top_connection_confirmed,
+        "Wall-to-floor/roof connection",
+        "Top lateral-load transfer and vertical continuity are confirmed." if wall.top_connection_confirmed else "Confirm top lateral-load transfer, anchorage, and vertical continuity.",
+        "Wall-level connection",
+    )
+    add(
+        stability.oop_check_provided,
+        "Concurrent minor-axis/OOP check supplied",
+        "OOP utilization is linked to this wall-level result." if stability.oop_check_provided else "Run the OOP wall tool for the same axial load and section, then enter its utilization.",
+        "7.8 / 10.8" if wall.edition == "S304-14" else "8.8 / 11.8",
+    )
+    if stability.oop_check_provided:
+        add(
+            stability.oop_stability_passed,
+            "Weak-axis slenderness and stability",
+            "The linked OOP stability check passes." if stability.oop_stability_passed else "The linked OOP stability check does not pass.",
+            "7.8 / 10.8" if wall.edition == "S304-14" else "8.8 / 11.8",
+        )
+        add(
+            stability.combined_utilization is not None
+            and stability.combined_utilization <= 1.0 + 1.0e-8,
+            "Conservative major/minor interaction screen",
+            f"In-plane utilization + OOP utilization = {stability.combined_utilization:.3f}; limit = 1.000.",
+            "Rational wall-level interaction screen",
+        )
+    checks.append(
+        Check(
+            "pass",
+            "Factored dead-load compression",
+            f"Pd = {pd:.2f} kN; calculated wall self-weight = {self_weight:.2f} kN."
+            + (" A direct Pd override is used." if wall.dead_load_compression is not None else " Pd = 0.9(D above + included wall self-weight)."),
+            "7.10 / 10.10" if wall.edition == "S304-14" else "8.10 / 11.10",
+        )
+    )
+    checks.append(
+        Check(
+            "pass",
+            "Solid rectangular wall scope",
+            "Flanged walls, openings, building-level load distribution, and seismic system classification are excluded by scope.",
+            "Declared scope",
+        )
+    )
+    return tuple(checks)
+
+
+def calculate_wall(wall: WallInput) -> WallResult:
+    physical_section = section_properties(wall, "Discrete")
+    discrete_curve, discrete_cap = interaction_curve(wall, physical_section)
+    discrete_mr = (
+        moment_at_axial_load(discrete_curve, wall.factored_axial)
+        if -_tension_cap(wall, physical_section) - 1.0e-8
+        <= wall.factored_axial
+        <= discrete_cap + 1.0e-8
+        else None
+    )
+    section = physical_section
+    curve = discrete_curve
+    cap = discrete_cap
+    moment_resistance = discrete_mr
+    alternate_curve: tuple[InteractionPoint, ...] | None = None
+    alternate_mr: float | None = None
+    if wall.wall_type == "Partially grouted reinforced masonry":
+        smeared_section = section_properties(wall, "Smeared")
+        smeared_curve, smeared_cap = interaction_curve(wall, smeared_section)
+        smeared_mr = (
+            moment_at_axial_load(smeared_curve, wall.factored_axial)
+            if -_tension_cap(wall, smeared_section) - 1.0e-8
+            <= wall.factored_axial
+            <= smeared_cap + 1.0e-8
+            else None
+        )
+        if wall.partial_grout_method == "Smeared":
+            section, curve, cap, moment_resistance = (
+                smeared_section,
+                smeared_curve,
+                smeared_cap,
+                smeared_mr,
+            )
+            alternate_curve, alternate_mr = discrete_curve, discrete_mr
+        elif wall.partial_grout_method == "Discrete":
+            alternate_curve, alternate_mr = smeared_curve, smeared_mr
+        else:
+            alternate_curve, alternate_mr = smeared_curve, smeared_mr
+            cap = min(discrete_cap, smeared_cap)
+            if discrete_mr is None or smeared_mr is None:
+                moment_resistance = None
+            elif smeared_mr < discrete_mr:
+                section, curve, moment_resistance = smeared_section, smeared_curve, smeared_mr
+                alternate_curve, alternate_mr = discrete_curve, discrete_mr
+            else:
+                moment_resistance = discrete_mr
+    tension_cap = _tension_cap(wall, section)
+    pm_utilization = (
+        wall.factored_moment / moment_resistance
+        if moment_resistance is not None and moment_resistance > 0.0
+        else None
+    )
+    self_weight = _wall_self_weight(wall, physical_section)
+    pd = _pd(wall, self_weight)
+    shear = _shear_result(wall, physical_section, pd)
+    sliding = _sliding_result(wall, physical_section, pd)
+    detailing = _detailing_result(wall, physical_section)
+    sliding_utilization = (
+        wall.factored_shear / sliding.resistance
+        if sliding.resistance > 0.0
+        else None
+    )
+    stability = StabilityResult(
+        combined_utilization=(
+            pm_utilization + wall.oop_utilization
+            if pm_utilization is not None and wall.oop_check_provided
+            else None
+        ),
+        oop_check_provided=wall.oop_check_provided,
+        oop_stability_passed=wall.oop_stability_passed,
+    )
+    checks = _checks(
+        wall,
+        physical_section,
+        cap,
+        tension_cap,
+        moment_resistance,
+        shear,
+        sliding,
+        detailing,
+        stability,
+        self_weight,
+        pd,
+    )
+    flex_clause = "10" if wall.edition == "S304-14" else "11"
+    shear_clause = (
+        "7.10" if wall.wall_type == "Unreinforced masonry" else "10.10"
+    ) if wall.edition == "S304-14" else (
+        "8.10" if wall.wall_type == "Unreinforced masonry" else "11.10"
+    )
+    trace = (
+        TraceEntry("f'm,ug", f"{section.fm_ungrouted:.3f}", "MPa", "CSA Table 4 concrete-block value", "Table 4"),
+        TraceEntry("f'm,g", f"{section.fm_grouted:.3f}", "MPa", "CSA Table 4 grouted-block value", "Table 4"),
+        TraceEntry("f'm,eff", f"{section.weighted_fm:.3f}", "MPa", "sum(f'm,i Ai) / Ae", "Table 4 partial-grout note"),
+        TraceEntry("Ae", f"{section.area:.1f}", "mm2", "mortar-bedded area plus grouted void area", f"{flex_clause}.3"),
+        TraceEntry("gamma_g", f"{section.gamma_g:.4f}", "-", "1.0 fully grouted; otherwise min(Ae/Ag, 0.5)", shear_clause),
+        TraceEntry("Pr,max", f"{cap:.3f}", "kN", "0.80 sum(0.85 phi_m f'm,i Ai)", f"{flex_clause}.4"),
+        TraceEntry("Mr(Pf)", "-" if moment_resistance is None else f"{moment_resistance:.3f}", "kN-m", "strain-compatible P-M envelope", f"{flex_clause}.2"),
+        TraceEntry("dv", f"{shear.effective_depth:.1f}", "mm", "0.8 lw", shear_clause),
+        TraceEntry("M/(Vdv)", f"{shear.moment_shear_ratio:.4f}", "-", "limited to 0.25 through 1.0", shear_clause),
+        TraceEntry("Vm", f"{shear.masonry_resistance:.3f}", "kN", shear.method, shear_clause),
+        TraceEntry("Vs", f"{shear.steel_resistance:.3f}", "kN", shear.method, shear_clause),
+        TraceEntry("Vr", f"{shear.resistance:.3f}", "kN", "min(Vm + Vs, Vr,max)", shear_clause),
+        TraceEntry("self-weight", f"{self_weight:.3f}", "kN", "unit material plus grout volume", "wall-level dead load"),
+        TraceEntry("Pd", f"{pd:.3f}", "kN", "0.9(D above + included wall self-weight), unless overridden", shear_clause),
+        TraceEntry("beta", "-" if shear.beta is None else f"{shear.beta:.6f}", "-", shear.method, shear_clause),
+        TraceEntry("theta", "-" if shear.theta_degrees is None else f"{shear.theta_degrees:.3f}", "deg", shear.method, shear_clause),
+        TraceEntry("epsilon_x", "-" if shear.epsilon_x is None else f"{shear.epsilon_x:.7f}", "-", "S304:24 general shear method", shear_clause),
+        TraceEntry("ze", "-" if shear.ze is None else f"{shear.ze:.3f}", "mm", "S304:24 general shear method", shear_clause),
+        TraceEntry("Vr,slide", f"{sliding.resistance:.3f}", "kN", sliding.method, shear_clause + ".5"),
+        TraceEntry("vertical ld", f"{detailing.vertical_development_required:.3f}", "mm", "CSA straight deformed-bar development", "12.4.2.3" if wall.edition == "S304-14" else "13.4.2.3"),
+    )
+    return WallResult(
+        wall=wall,
+        section=section,
+        curve=curve,
+        alternate_curve=alternate_curve,
+        axial_cap=cap,
+        tension_cap=tension_cap,
+        moment_resistance=moment_resistance,
+        alternate_moment_resistance=alternate_mr,
+        pm_utilization=pm_utilization,
+        shear=shear,
+        sliding=sliding,
+        detailing=detailing,
+        stability=stability,
+        self_weight=self_weight,
+        pd=pd,
+        sliding_resistance=sliding.resistance,
+        sliding_utilization=sliding_utilization,
+        checks=checks,
+        trace=trace,
+    )
+
+
+__all__ = [
+    "BAR_AREAS",
+    "BAR_PROPERTIES",
+    "CalculationError",
+    "Check",
+    "DetailingResult",
+    "InteractionPoint",
+    "SectionProperties",
+    "ShearResult",
+    "SlidingResult",
+    "StabilityResult",
+    "TraceEntry",
+    "WallInput",
+    "WallResult",
+    "beta_one",
+    "calculate_wall",
+    "interaction_curve",
+    "masonry_strengths",
+    "moment_at_axial_load",
+    "section_point_at_c",
+    "section_properties",
+]
