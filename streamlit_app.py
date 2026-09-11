@@ -18,7 +18,7 @@ WallResult = engine.WallResult
 calculate_wall = engine.calculate_wall
 
 
-BUILD_MARKER = "2026-08-29.04"
+BUILD_MARKER = "2026-09-11.01"
 SOURCE_URL = "https://github.com/BowenZeng/in-plane-masonry-walls"
 
 
@@ -26,14 +26,14 @@ def _fmt(value: float | None, digits: int = 2) -> str:
     return "-" if value is None else f"{value:,.{digits}f}"
 
 
-def _status(result: WallResult) -> tuple[str, str]:
+def _status(result: WallResult) -> str:
     blocked = sum(check.level == "blocked" for check in result.checks)
     warnings = sum(check.level == "warning" for check in result.checks)
     if blocked:
-        return f"{blocked} BLOCKED", "#b42318"
+        return f"{blocked} BLOCKED"
     if warnings:
-        return "REVIEW REQUIRED", "#b54708"
-    return "PASS", "#177245"
+        return "REVIEW REQUIRED"
+    return "PASS"
 
 
 def _summary(results: dict[str, WallResult]) -> pd.DataFrame:
@@ -56,13 +56,12 @@ def _summary(results: dict[str, WallResult]) -> pd.DataFrame:
                 (
                     edition,
                     "Diagonal shear utilization",
-                    result.wall.factored_shear / result.shear.resistance
-                    if result.shear.resistance > 0.0
-                    else None,
+                    engine.demand_utilization(result.wall.factored_shear, result.shear.resistance),
                     "-",
                 ),
                 (edition, "Sliding shear resistance", result.sliding_resistance, "kN"),
                 (edition, "Sliding shear utilization", result.sliding_utilization, "-"),
+                (edition, "Stack-pattern vertical joint resistance", result.shear.stack_vertical_resistance, "kN"),
                 (edition, "Shear beta", result.shear.beta, "-"),
                 (edition, "Shear theta", result.shear.theta_degrees, "deg"),
                 (edition, "Required horizontal area", result.shear.required_horizontal_area, "mm2"),
@@ -88,7 +87,7 @@ def _curve_frame(results: dict[str, WallResult]) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for edition, result in results.items():
         for curve_label, curve in (
-            ("Selected", result.curve),
+            ("Selected at entered Pf", result.curve),
             ("Alternate", result.alternate_curve),
         ):
             if curve is None:
@@ -111,6 +110,7 @@ def _pm_chart(results: dict[str, WallResult]) -> alt.Chart:
     curves = _curve_frame(results)
     x_max = max(curves["Moment resistance (kN-m)"].max(), next(iter(results.values())).wall.factored_moment) * 1.05
     y_max = max(curves["Axial resistance (kN)"].max(), next(iter(results.values())).wall.factored_axial) * 1.05
+    y_min = min(0.0, curves["Axial resistance (kN)"].min(), next(iter(results.values())).wall.factored_axial) * 1.05
     demand = pd.DataFrame(
         [
             {
@@ -127,12 +127,12 @@ def _pm_chart(results: dict[str, WallResult]) -> alt.Chart:
             x=alt.X(
                 "Moment resistance (kN-m):Q",
                 title="Factored moment resistance (kN-m)",
-                scale=alt.Scale(domain=[0.0, x_max]),
+                scale=alt.Scale(domain=[0.0, max(x_max, 1.0)]),
             ),
             y=alt.Y(
                 "Axial resistance (kN):Q",
                 title="Factored axial resistance (kN)",
-                scale=alt.Scale(domain=[0.0, y_max]),
+                scale=alt.Scale(domain=[y_min, max(y_max, 1.0)]),
             ),
             color=alt.Color(
                 "Edition:N",
@@ -143,7 +143,7 @@ def _pm_chart(results: dict[str, WallResult]) -> alt.Chart:
             ),
             strokeDash=alt.StrokeDash(
                 "Curve:N",
-                scale=alt.Scale(domain=["Selected", "Alternate"], range=[[1, 0], [6, 4]]),
+                scale=alt.Scale(domain=["Selected at entered Pf", "Alternate"], range=[[1, 0], [6, 4]]),
             ),
             order="Order:Q",
             tooltip=[
@@ -156,7 +156,7 @@ def _pm_chart(results: dict[str, WallResult]) -> alt.Chart:
     )
     marker = (
         alt.Chart(demand)
-        .mark_point(size=130, filled=True, color="#1f2937", shape="cross")
+        .mark_point(size=130, filled=True, color="#e11d48", shape="cross")
         .encode(
             x="Moment resistance (kN-m):Q",
             y="Axial resistance (kN):Q",
@@ -199,22 +199,6 @@ def _trace_frame(result: WallResult) -> pd.DataFrame:
     )
 
 
-def _edition_notes(wall_type: str) -> list[str]:
-    notes = [
-        "Table 4 concrete-masonry strengths are evaluated separately for each edition.",
-        "S304-14 reinforced flexure is Clause 10; S304:24 moves it to Clause 11. Strong-axis compression uses the same 0.85 phi_m f'm block, while the 2024 wording removes the 2014 direction factor from vertically spanning walls.",
-        "For squat reinforced walls, S304:24 adds the distance to the tensile-steel centroid to the effective-depth limit.",
-        "S304:24 replaces the 2014 reinforced-wall shear equation with beta-theta modified-compression-field provisions; both simplified and general routes are calculated and can be compared.",
-        "S304:24 base sliding shear uses mu C without the S304-14 phi_m multiplier.",
-        "S304:24 adds 0.5hw to the bond-beam spacing limit for horizontal shear reinforcement.",
-    ]
-    if wall_type == "Unreinforced masonry":
-        notes.append(
-            "For unreinforced in-plane shear, S304:24 Clause 8.10.2.3 omits the 2014 sqrt(f'm) multiplier in vm; the edition curves otherwise retain the elastic/cracked eccentricity branches."
-        )
-    return notes
-
-
 def _downloads(results: dict[str, WallResult]) -> tuple[bytes, bytes, bytes]:
     summary = _summary(results).to_csv(index=False).encode("utf-8")
     curves = _curve_frame(results).to_csv(index=False).encode("utf-8")
@@ -235,22 +219,12 @@ def main() -> None:
         """
         <style>
         .block-container {max-width: 1320px; padding-top: 2rem;}
-        div[data-testid="stMetric"] {border: 1px solid #d8dee8; border-radius: .65rem; padding: .8rem 1rem;}
-        .status-card {border: 1px solid #d8dee8; border-radius: .65rem; padding: .9rem 1rem; background: #f8fafc;}
-        .status-card h3 {margin: 0 0 .25rem 0; font-size: 1.05rem; color: #1f2937;}
-        .status-card p {margin: 0; font-weight: 700;}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
     st.title("In-plane masonry wall design")
-    st.caption(
-        f"CSA S304-14 / CSA S304:24 comparison · validated draft · build {BUILD_MARKER}"
-    )
-    st.write(
-        "Rectangular strong-axis wall checks for unreinforced, fully grouted reinforced, and partially grouted reinforced concrete masonry."
-    )
     st.link_button("Source code", SOURCE_URL)
 
     with st.sidebar:
@@ -264,10 +238,11 @@ def main() -> None:
             ],
         )
         geometry = st.columns(2)
-        length = geometry[0].number_input("Length lw (mm)", min_value=400.0, value=5000.0, step=100.0)
-        height = geometry[1].number_input("Height hw (mm)", min_value=400.0, value=5000.0, step=100.0)
+        length = geometry[0].number_input("Length lw (mm)", min_value=400.0, value=5000.0, step=100.0, format="%.0f")
+        height = geometry[1].number_input("Height hw (mm)", min_value=400.0, value=5000.0, step=100.0, format="%.0f")
         thickness = st.selectbox("Actual thickness t (mm)", [140.0, 190.0, 240.0, 290.0], index=1)
         bond_pattern = st.selectbox("Bond pattern", ["Running bond", "Stack pattern"])
+        free_standing = st.checkbox("Free-standing cantilever (no top or side supports)", value=False)
 
         st.header("Masonry")
         material = st.columns(2)
@@ -278,6 +253,7 @@ def main() -> None:
             ["Hollow ungrouted", "Fully grouted hollow", "Solid units"],
             disabled=wall_type != "Unreinforced masonry",
         )
+        precracked = st.checkbox("Treat unreinforced wall as cracked under all combinations", value=False, disabled=wall_type != "Unreinforced masonry")
         partial_method = st.selectbox(
             "Partial-grout flexural method",
             ["Use lower of discrete and smeared", "Discrete", "Smeared"],
@@ -318,12 +294,13 @@ def main() -> None:
         ties = st.columns(2)
         tie_diameter = ties[0].number_input("Tie diameter (mm)", min_value=3.0, value=3.65, step=0.05, disabled=not compression_tied)
         tie_spacing = ties[1].number_input("Tie spacing (mm)", min_value=1.0, value=200.0, step=25.0, disabled=not compression_tied)
+        tie_arrangement = st.checkbox("Tie hooks, placement, and lateral support of bars confirmed", value=False, disabled=not reinforced or not compression_tied)
         developed = st.checkbox(
-            "Vertical bars develop yield across base sliding plane",
+            "Vertical bars develop yield on both sides of sliding plane",
             value=True,
             disabled=not reinforced,
         )
-        developed_count = int(st.number_input("Developed vertical bars at sliding plane", min_value=0, value=min(5, bar_count) if reinforced else 0, step=1, disabled=not reinforced or not developed))
+        developed_count = int(st.number_input("Developed vertical bars at sliding plane", min_value=0, max_value=bar_count if reinforced else 0, value=min(5, bar_count) if reinforced else 0, step=1, disabled=not reinforced or not developed))
 
         st.header("Horizontal shear reinforcement")
         horizontal_type = st.selectbox(
@@ -337,16 +314,24 @@ def main() -> None:
         horizontal_bar_size = st.selectbox("Bond-beam bar size", list(BAR_AREAS), disabled=horizontal_type != "Bond beam bars")
         joint_wire_diameter = st.number_input("Joint-wire diameter (mm)", min_value=3.0, value=3.65, step=0.05, disabled=horizontal_type != "Joint reinforcement")
         horizontal_anchored = st.checkbox("Horizontal reinforcement anchored at both wall ends", value=False, disabled=horizontal_type == "None")
-        horizontal_continuous = st.checkbox("Horizontal reinforcement continuous along wall and at top", value=False, disabled=horizontal_type == "None")
+        horizontal_continuous = st.checkbox("Horizontal reinforcement continuous along wall and at top", value=False, disabled=horizontal_type == "None", help="For design joint reinforcement, confirm full anchorage, Class B splices and corner/intersection detailing.")
         horizontal_top_bar = st.checkbox("More than 300 mm fresh grout below horizontal bar", value=False, disabled=horizontal_type != "Bond beam bars")
         shear_method = st.selectbox("S304:24 shear method", ["Use lower of simplified and general", "Simplified", "General"])
         grout_type = st.selectbox("Grout type for general shear", ["Coarse", "Fine"])
+        squat_distribution = st.checkbox("Squat-wall shear is distributed along the full length", value=False, disabled=height >= length, help="Required to use the increased 2014 shear cap, or the increased unreinforced 2024 shear cap.")
+        stack_supplied = False
+        stack_area = stack_shear = 0.0
+        if bond_pattern == "Stack pattern":
+            with st.expander("Vertical head-joint shear", expanded=True):
+                stack_supplied = st.checkbox("Head-joint demand and crossing reinforcement are supplied", value=False)
+                stack_area = st.number_input("Total developed area crossing assessed head joint (mm2)", min_value=0.0, value=0.0, step=100.0)
+                stack_shear = st.number_input("Factored vertical shear at assessed head joint (kN)", min_value=0.0, value=0.0, step=10.0, help="From wall-level shear-flow analysis over the same joint length as the entered reinforcement area; this is distinct from horizontal Vf.")
 
-        st.header("Factored actions")
+        st.header("Factored actions at checked section")
         actions = st.columns(2)
         pf = actions[0].number_input("Axial load Pf (kN; compression +)", value=200.0, step=10.0)
-        mf = actions[1].number_input("In-plane moment Mf (kN-m)", min_value=0.0, value=1000.0, step=50.0)
-        vf = actions[0].number_input("In-plane shear Vf (kN)", min_value=0.0, value=200.0, step=10.0)
+        mf = actions[1].number_input("In-plane moment Mf (kN-m)", min_value=0.0, value=1000.0, step=50.0, help="Magnitude at the checked section, including applicable secondary effects from the wall analysis.")
+        vf = actions[0].number_input("In-plane shear Vf (kN)", min_value=0.0, value=200.0, step=10.0, help="Concurrent shear magnitude at the same section and load combination as Pf and Mf.")
         dead_above = actions[1].number_input("Unfactored dead load above wall D (kN)", min_value=0.0, value=150.0, step=10.0)
         include_self_weight = st.checkbox("Include calculated wall self-weight in Pd = 0.9D", value=True)
         override_pd = st.checkbox("Use direct factored Pd override", value=False)
@@ -368,6 +353,7 @@ def main() -> None:
             horizontal_development = st.number_input("Available horizontal development (mm)", min_value=1.0, value=600.0, step=50.0)
             splice_present = st.checkbox("Vertical tension lap splice present", value=False)
             splice_class = st.selectbox("Splice class", ["B", "A"], disabled=not splice_present)
+            class_a_confirmed = st.checkbox("Class A: As provided/required >= 2 and at most 50% spliced", value=False, disabled=not splice_present or splice_class != "A")
             lap_length = st.number_input("Provided lap length (mm)", min_value=1.0, value=1200.0, step=50.0, disabled=not splice_present)
             bars_continuous = st.checkbox("Vertical bars continuous over wall height", value=True)
             termination_extension = st.number_input("Available extension past flexural cutoff (mm)", min_value=0.0, value=5000.0, step=100.0, disabled=bars_continuous)
@@ -375,16 +361,19 @@ def main() -> None:
 
         with st.expander("Wall connections and OOP interface"):
             base_connection = st.checkbox("Wall-to-foundation force transfer confirmed", value=False)
-            top_connection = st.checkbox("Wall-to-floor/roof force transfer confirmed", value=False)
+            top_connection = st.checkbox("Wall-to-floor/roof force transfer confirmed", value=False, disabled=free_standing)
             oop_provided = st.checkbox("Linked OOP wall result supplied", value=False)
-            oop_utilization = st.number_input("OOP utilization", min_value=0.0, value=0.0, step=0.05, disabled=not oop_provided)
-            oop_stability = st.checkbox("OOP weak-axis stability passes", value=False, disabled=not oop_provided)
+            oop_utilizations = {
+                edition: st.number_input(f"{edition} OOP utilization", min_value=0.0, value=0.0, step=0.05, disabled=not oop_provided)
+                for edition in ("S304-14", "S304:24")
+            }
+            oop_stability = st.checkbox("OOP weak-axis stability passes for both editions", value=False, disabled=not oop_provided)
 
         with st.expander("Self-weight material inputs"):
             masonry_density = st.number_input("Masonry material density (kg/m3)", min_value=1.0, value=2100.0, step=50.0)
             grout_density = st.number_input("Grout density (kg/m3)", min_value=1.0, value=2350.0, step=50.0)
             solid_fraction = st.number_input("Unit solid fraction", min_value=0.01, max_value=1.0, value=0.56, step=0.01)
-        st.caption("Inputs are applied unchanged to both editions; only edition rules and table strengths differ.")
+            height_above = st.number_input("Wall height above checked section (mm)", min_value=0.0, max_value=float(height), value=float(height), step=100.0, help="Use zero at the top joint; enter only the height above an intermediate joint.")
 
     common = dict(
         wall_type=wall_type,
@@ -394,7 +383,9 @@ def main() -> None:
         nominal_unit_strength=float(unit_strength),
         mortar_type=mortar,
         bond_pattern=bond_pattern,
+        free_standing=bool(free_standing),
         unreinforced_condition=unreinforced_condition,
+        unreinforced_precracked=bool(precracked and not reinforced),
         partial_grout_method=partial_method,
         unit_geometry_confirmed=bool(unit_geometry_confirmed),
         face_shell_thickness=float(face_shell),
@@ -403,7 +394,8 @@ def main() -> None:
         bar_count=bar_count if reinforced else 0,
         end_bar_distance=float(end_distance),
         fy=float(fy),
-        compression_reinforcement_tied=bool(compression_tied),
+        compression_reinforcement_tied=bool(compression_tied and reinforced),
+        tie_arrangement_confirmed=bool(tie_arrangement and compression_tied and reinforced),
         tie_diameter=float(tie_diameter),
         tie_spacing=float(tie_spacing),
         horizontal_reinforcement_type=horizontal_type,
@@ -416,12 +408,16 @@ def main() -> None:
         horizontal_top_bar=bool(horizontal_top_bar and horizontal_type == "Bond beam bars"),
         shear_method=shear_method,
         grout_type=grout_type,
+        squat_shear_distribution_confirmed=bool(squat_distribution),
+        stack_joint_area=float(stack_area) if stack_supplied else None,
+        stack_vertical_shear=float(stack_shear) if stack_supplied else None,
         factored_axial=float(pf),
         factored_moment=float(mf),
         factored_shear=float(vf),
         dead_load_compression=float(pd_override) if override_pd else None,
         unfactored_dead_load_above=float(dead_above),
         include_wall_self_weight_in_pd=bool(include_self_weight),
+        height_above_section=float(height_above),
         masonry_density=float(masonry_density),
         grout_density=float(grout_density),
         unit_solid_fraction=float(solid_fraction),
@@ -435,8 +431,9 @@ def main() -> None:
         epoxy_coated_vertical_bars=bool(epoxy),
         available_vertical_development=float(vertical_development),
         available_horizontal_development=float(horizontal_development),
-        splice_present=bool(splice_present),
+        splice_present=bool(splice_present and reinforced),
         splice_class=splice_class,
+        class_a_splice_confirmed=bool(class_a_confirmed),
         provided_lap_length=float(lap_length),
         vertical_bars_continuous=bool(bars_continuous),
         available_termination_extension=float(termination_extension),
@@ -445,14 +442,13 @@ def main() -> None:
         base_connection_confirmed=bool(base_connection),
         top_connection_confirmed=bool(top_connection),
         oop_check_provided=bool(oop_provided),
-        oop_utilization=float(oop_utilization),
         oop_stability_passed=bool(oop_stability),
     )
     results: dict[str, WallResult] = {}
     errors: list[str] = []
     for edition in ("S304-14", "S304:24"):
         try:
-            results[edition] = calculate_wall(WallInput(edition=edition, **common))
+            results[edition] = calculate_wall(WallInput(edition=edition, oop_utilization=float(oop_utilizations[edition]), **common))
         except CalculationError as error:
             errors.append(f"{edition}: {error}")
     if errors:
@@ -460,44 +456,6 @@ def main() -> None:
             st.error(error)
         st.stop()
 
-    status_columns = st.columns(2)
-    for column, (edition, result) in zip(status_columns, results.items()):
-        label, color = _status(result)
-        with column:
-            st.markdown(
-                f'<div class="status-card"><h3>{edition}</h3><p style="color:{color}">{label}</p></div>',
-                unsafe_allow_html=True,
-            )
-
-    result14, result24 = results.values()
-    moment_metrics = st.columns(2)
-    moment_metrics[0].metric("2014 Mr(Pf) (kN-m)", _fmt(result14.moment_resistance))
-    moment_metrics[1].metric("2024 Mr(Pf) (kN-m)", _fmt(result24.moment_resistance))
-    shear_metrics = st.columns(2)
-    shear_metrics[0].metric("2014 diagonal shear Vr (kN)", _fmt(result14.shear.resistance))
-    shear_metrics[1].metric("2024 diagonal shear Vr (kN)", _fmt(result24.shear.resistance))
-
-    st.subheader("Shear branch details")
-    shear_rows = []
-    for edition, result in results.items():
-        shear_rows.append(
-            {
-                "Edition": edition,
-                "Method": result.shear.method,
-                "Pd (kN)": result.pd,
-                "beta": result.shear.beta,
-                "theta (deg)": result.shear.theta_degrees,
-                "Vm (kN)": result.shear.masonry_resistance,
-                "Vs (kN)": result.shear.steel_resistance,
-                "Vr,max (kN)": result.shear.maximum_resistance,
-                "Vr (kN)": result.shear.resistance,
-                "Av required (mm2)": result.shear.required_horizontal_area,
-                "Av,min 2024 (mm2)": result.shear.minimum_horizontal_area_2024,
-                "Simplified Vr (kN)": result.shear.simplified_resistance,
-                "General Vr (kN)": result.shear.general_resistance,
-            }
-        )
-    st.dataframe(pd.DataFrame(shear_rows), hide_index=True, width="stretch")
 
     st.subheader("P-M interaction")
     st.altair_chart(_pm_chart(results), width="stretch")
@@ -517,14 +475,11 @@ def main() -> None:
         },
     )
 
-    with st.expander("What changes between editions", expanded=True):
-        for note in _edition_notes(wall_type):
-            st.markdown(f"- {note}")
-
     st.subheader("Section checks")
     tabs = st.tabs(list(results))
     for tab, (edition, result) in zip(tabs, results.items()):
         with tab:
+            st.caption(_status(result))
             st.dataframe(_check_frame(result), width="stretch", hide_index=True)
             if result.shear.required_horizontal_area is not None:
                 st.caption(
@@ -532,7 +487,7 @@ def main() -> None:
                 )
 
     with st.expander("Section model and reinforcement layout"):
-        model = result14.section
+        model = results["S304-14"].section
         rows = [
             ("Effective area Ae", model.area, "mm2"),
             ("Gross area Ag", model.gross_area, "mm2"),
@@ -558,9 +513,7 @@ def main() -> None:
     download_columns[1].download_button("Download P-M points CSV", curves_csv, "in_plane_wall_pm_points.csv", "text/csv")
     download_columns[2].download_button("Download checks CSV", checks_csv, "in_plane_wall_checks.csv", "text/csv")
 
-    st.warning(
-        "Validated draft for solid rectangular wall-level design. Flanged walls, openings, building-level load distribution, and seismic system classification are excluded. A qualified designer remains responsible for the entered actions, materials, connection details, and linked OOP result."
-    )
+    st.caption(f"Build {BUILD_MARKER}")
 
 
 if __name__ == "__main__":

@@ -34,10 +34,10 @@ EPS_MU = 0.003
 ECCENTRICITY_LIMIT = 0.33
 
 BAR_PROPERTIES = {
-    "10M": (100.0, 10.0),
-    "15M": (200.0, 15.0),
-    "20M": (300.0, 20.0),
-    "25M": (500.0, 25.0),
+    "10M": (100.0, 11.3),
+    "15M": (200.0, 16.0),
+    "20M": (300.0, 19.5),
+    "25M": (500.0, 25.2),
 }
 BAR_AREAS = {size: values[0] for size, values in BAR_PROPERTIES.items()}
 
@@ -91,7 +91,9 @@ class WallInput:
     nominal_unit_strength: float = 15.0
     mortar_type: str = "Type S"
     bond_pattern: str = "Running bond"
+    free_standing: bool = False
     unreinforced_condition: str = "Hollow ungrouted"
+    unreinforced_precracked: bool = False
     partial_grout_method: str = "Use lower of discrete and smeared"
     unit_geometry_confirmed: bool = False
     face_shell_thickness: float = 36.2
@@ -101,6 +103,7 @@ class WallInput:
     end_bar_distance: float = 100.0
     fy: float = 400.0
     compression_reinforcement_tied: bool = False
+    tie_arrangement_confirmed: bool = False
     tie_diameter: float = 3.65
     tie_spacing: float = 200.0
     horizontal_reinforcement_type: str = "None"
@@ -113,12 +116,16 @@ class WallInput:
     horizontal_top_bar: bool = False
     shear_method: str = "Use lower of simplified and general"
     grout_type: str = "Coarse"
+    squat_shear_distribution_confirmed: bool = False
+    stack_joint_area: float | None = None
+    stack_vertical_shear: float | None = None
     factored_axial: float = 200.0
     factored_moment: float = 1000.0
     factored_shear: float = 200.0
     dead_load_compression: float | None = None
     unfactored_dead_load_above: float = 150.0
     include_wall_self_weight_in_pd: bool = True
+    height_above_section: float | None = None
     masonry_density: float = 2100.0
     grout_density: float = 2350.0
     unit_solid_fraction: float = 0.56
@@ -134,6 +141,7 @@ class WallInput:
     available_horizontal_development: float = 600.0
     splice_present: bool = False
     splice_class: str = "B"
+    class_a_splice_confirmed: bool = False
     provided_lap_length: float = 1200.0
     vertical_bars_continuous: bool = True
     available_termination_extension: float = 5000.0
@@ -200,6 +208,7 @@ class ShearResult:
     epsilon_x: float | None
     ze: float | None
     method: str
+    stack_vertical_resistance: float | None = None
 
 
 @dataclass(frozen=True)
@@ -383,11 +392,39 @@ def _validate(wall: WallInput) -> None:
         raise CalculationError(f"Unsupported vertical bar size: {wall.bar_size}.")
     if wall.horizontal_bar_size not in BAR_AREAS:
         raise CalculationError(f"Unsupported horizontal bar size: {wall.horizontal_bar_size}.")
+    if wall.horizontal_reinforcement_type == "Bond beam bars" and wall.horizontal_fy > 400.0:
+        raise CalculationError("Bond-beam reinforcing bars are limited to fy <= 400 MPa; wire is a separate material route.")
+    if type(wall.bar_count) is not int or wall.bar_count < 0:
+        raise CalculationError("Vertical-bar count must be a non-negative integer.")
+    if wall.developed_vertical_bar_count is not None and type(wall.developed_vertical_bar_count) is not int:
+        raise CalculationError("Developed vertical-bar count must be an integer.")
+    for name, value in {
+        "tie diameter": wall.tie_diameter,
+        "tie spacing": wall.tie_spacing,
+        "joint-wire diameter": wall.joint_wire_diameter,
+        "mortar-joint thickness": wall.mortar_joint_thickness,
+    }.items():
+        if not math.isfinite(value) or value <= 0.0:
+            raise CalculationError(f"{name.capitalize()} must be positive and finite.")
+    for name, value in {
+        "stack-joint reinforcement area": wall.stack_joint_area,
+        "vertical shear at stack joint": wall.stack_vertical_shear,
+        "wall height above checked section": wall.height_above_section,
+    }.items():
+        if value is not None and (not math.isfinite(value) or value < 0.0):
+            raise CalculationError(f"{name.capitalize()} must be non-negative and finite.")
+    if wall.height_above_section is not None and wall.height_above_section > wall.height:
+        raise CalculationError("Height above the checked section cannot exceed the total wall height.")
     if wall.wall_type != "Unreinforced masonry":
         if wall.bar_count < 2:
             raise CalculationError("A reinforced wall requires at least two vertical bars.")
         if not 0.0 < wall.end_bar_distance < wall.length / 2.0:
             raise CalculationError("End-bar distance must lie inside both ends of the wall.")
+        diameter = BAR_PROPERTIES[wall.bar_size][1]
+        if wall.end_bar_distance < diameter / 2.0:
+            raise CalculationError("Vertical bars must fit inside the wall ends.")
+        if (wall.length - 2.0 * wall.end_bar_distance) / (wall.bar_count - 1) <= diameter:
+            raise CalculationError("Vertical bars overlap at the entered spacing.")
     elif wall.factored_axial < 0.0:
         raise CalculationError("Unreinforced masonry is not credited with concentric axial-tension resistance.")
     if wall.wall_type == "Partially grouted reinforced masonry":
@@ -508,10 +545,7 @@ def section_properties(wall: WallInput, method: str | None = None) -> SectionPro
     )
     gross_area = wall.length * wall.thickness
     grout_fraction = grouted_area / area
-    fully_grouted = wall.wall_type == "Fully grouted reinforced masonry" or (
-        wall.wall_type == "Unreinforced masonry"
-        and wall.unreinforced_condition in ("Fully grouted hollow", "Solid units")
-    )
+    fully_grouted = grouted_length >= wall.length - 1.0e-8
     gamma_g = 1.0 if fully_grouted else min(area / gross_area, 0.5)
     bar_spacing = (
         (wall.length - 2.0 * wall.end_bar_distance) / (wall.bar_count - 1)
@@ -532,8 +566,17 @@ def section_properties(wall: WallInput, method: str | None = None) -> SectionPro
         bar_spacing=bar_spacing,
         fm_ungrouted=fm_ungrouted,
         fm_grouted=fm_grouted,
-        ft=_FT_TABLE[wall.unreinforced_condition][wall.mortar_type],
+        ft=0.1 if wall.free_standing else _FT_TABLE[wall.unreinforced_condition][wall.mortar_type],
         segments=segments,
+    )
+
+
+def _ties_qualify(wall: WallInput) -> bool:
+    return (
+        wall.compression_reinforcement_tied
+        and wall.tie_arrangement_confirmed
+        and wall.tie_diameter >= 3.65
+        and wall.tie_spacing <= min(16.0 * BAR_PROPERTIES[wall.bar_size][1], 48.0 * wall.tie_diameter, wall.thickness)
     )
 
 
@@ -542,7 +585,7 @@ def _axial_cap(wall: WallInput, section: SectionProperties) -> float:
         0.85 * PHI_M * s.fm * (s.x1 - s.x0) * s.effective_thickness
         for s in section.segments
     )
-    if wall.compression_reinforcement_tied and section.bar_positions:
+    if _ties_qualify(wall) and section.bar_positions:
         steel_area = len(section.bar_positions) * BAR_AREAS[wall.bar_size]
         compression += steel_area * (
             PHI_S * wall.fy - 0.85 * PHI_M * section.fm_grouted
@@ -561,7 +604,8 @@ def _tension_cap(wall: WallInput, section: SectionProperties) -> float:
 
 
 def _wall_self_weight(wall: WallInput, section: SectionProperties) -> float:
-    gross_volume = wall.length * wall.height * wall.thickness * 1.0e-9
+    height = wall.height if wall.height_above_section is None else wall.height_above_section
+    gross_volume = wall.length * height * wall.thickness * 1.0e-9
     if wall.wall_type == "Unreinforced masonry" and wall.unreinforced_condition == "Solid units":
         mass = gross_volume * wall.masonry_density
     else:
@@ -591,6 +635,8 @@ def _development_length(
     *,
     horizontal: bool,
 ) -> float | None:
+    if not horizontal and not section.bar_positions:
+        return None
     if horizontal and wall.horizontal_reinforcement_type != "Bond beam bars":
         return None
     if horizontal and wall.horizontal_reinforcement_area <= 0.0:
@@ -605,22 +651,19 @@ def _development_length(
         spacing = wall.horizontal_reinforcement_spacing
     if area <= 0.0 or diameter <= 0.0:
         return None
-    dcs = min(wall.least_clear_cell_dimension / 2.0, 2.0 * spacing / 3.0)
-    transverse_index = 0.0
-    if not horizontal and wall.horizontal_reinforcement_type != "None" and wall.horizontal_anchorage_confirmed:
-        transverse_index = (
-            wall.horizontal_reinforcement_area
-            * min(wall.horizontal_fy, 400.0)
-            / (10.5 * wall.horizontal_reinforcement_spacing)
-        )
-    denominator = min(dcs + transverse_index, 2.5 * diameter)
+    # The clear-space bound is conservative for the centred-bar model. Ktr = 0:
+    # Av alone does not establish Atr or n across a bond-splitting plane.
+    dcs = min(wall.least_clear_cell_dimension / 2.0, wall.thickness / 2.0, 2.0 * spacing / 3.0)
+    if not horizontal:
+        dcs = min(dcs, wall.end_bar_distance)
+    denominator = min(dcs, 2.5 * diameter)
     k1 = 1.3 if horizontal and wall.horizontal_top_bar else 1.0
     if wall.epoxy_coated_vertical_bars and not horizontal:
         clear_cover = max((wall.least_clear_cell_dimension - diameter) / 2.0, 0.0)
-        k2 = 1.5 if clear_cover < 3.0 * diameter else 1.2
+        k2 = 1.5 if clear_cover < 3.0 * diameter or spacing - diameter < 6.0 * diameter else 1.2
     else:
         k2 = 1.0
-    k3 = 0.8 if diameter <= 20.0 else 1.0
+    k3 = 0.8 if (wall.horizontal_bar_size if horizontal else wall.bar_size) != "25M" else 1.0
     return max(
         1.15
         * min(k1 * k2, 1.7)
@@ -661,6 +704,25 @@ def _detailing_result(
     )
 
 
+def _horizontal_area_credited(wall: WallInput, section: SectionProperties) -> float:
+    if not (wall.horizontal_anchorage_confirmed and wall.horizontal_continuity_confirmed):
+        return 0.0
+    if wall.horizontal_reinforcement_type == "Bond beam bars":
+        ld = _development_length(wall, section, horizontal=True)
+        if (
+            ld is None or wall.available_horizontal_development < ld
+            or wall.horizontal_reinforcement_area < BAR_AREAS[wall.horizontal_bar_size]
+            or BAR_PROPERTIES[wall.horizontal_bar_size][1] > wall.least_clear_cell_dimension / 2.0
+        ):
+            return 0.0
+    elif wall.horizontal_reinforcement_type == "Joint reinforcement":
+        if not 3.0 <= wall.joint_wire_diameter <= min(5.0, wall.mortar_joint_thickness / 2.0):
+            return 0.0
+    else:
+        return 0.0
+    return wall.horizontal_reinforcement_area
+
+
 def section_point_at_c(
     wall: WallInput,
     neutral_axis: float,
@@ -694,7 +756,7 @@ def section_point_at_c(
             stress = min(wall.fy, E_S * strain)
             force = PHI_S * bar_area * stress
             tension.append((position, force))
-        elif wall.compression_reinforcement_tied:
+        elif _ties_qualify(wall):
             stress = min(wall.fy, E_S * abs(strain))
             force = PHI_S * bar_area * stress
             if position <= beta_one(section.fm_grouted) * neutral_axis:
@@ -767,10 +829,17 @@ def _reinforced_curve(
     cap = _axial_cap(wall, section)
     tension_cap = _tension_cap(wall, section)
     c_max = wall.length / min(beta_one(s.fm) for s in section.segments)
-    raw = [
-        section_point_at_c(wall, max(1.0e-6, c_max * i / samples), section)
-        for i in range(1, samples + 1)
-    ]
+    if _ties_qualify(wall):
+        c_max = max(c_max, max(section.bar_positions) * EPS_MU / (EPS_MU - wall.fy / E_S))
+    depths = {c_max * i / samples for i in range(1, samples + 1)}
+    yield_strain = wall.fy / E_S
+    for position in section.bar_positions:
+        depths.update((position, position * EPS_MU / (EPS_MU + yield_strain)))
+        if _ties_qualify(wall) and yield_strain < EPS_MU:
+            depths.add(position * EPS_MU / (EPS_MU - yield_strain))
+    for segment in section.segments:
+        depths.update((segment.x0 / beta_one(segment.fm), segment.x1 / beta_one(segment.fm)))
+    raw = [section_point_at_c(wall, c, section) for c in sorted(depths) if 0.0 < c <= c_max]
     curve: list[InteractionPoint] = [
         InteractionPoint(-tension_cap, 0.0, 0.0, "tension-cap")
     ]
@@ -792,40 +861,41 @@ def _reinforced_curve(
     return tuple(curve), cap
 
 
+def _unreinforced_point(wall: WallInput, section: SectionProperties, p: float) -> InteractionPoint:
+    segment = section.segments[0]
+    stress = 0.85 * PHI_M * segment.fm
+    p_n = p * 1000.0
+    compression_limit = (
+        0.60 * PHI_M * segment.fm - p_n / section.area
+    ) * section.section_modulus
+    tension_limit = (
+        PHI_M * section.ft + p_n / section.area
+    ) * section.section_modulus
+    uncracked = 0.0 if wall.unreinforced_precracked else max(0.0, min(compression_limit, tension_limit))
+    if p_n == 0.0:
+        cracked = 0.0
+        c = 0.0
+    else:
+        block_depth = p_n / (stress * segment.effective_thickness)
+        c = block_depth / beta_one(segment.fm)
+        raw = p_n * (section.centroid - block_depth / 2.0)
+        cracked = min(raw, p_n * ECCENTRICITY_LIMIT * wall.length)
+    if not wall.unreinforced_precracked and uncracked >= cracked:
+        moment, branch = uncracked, "uncracked"
+    else:
+        moment, branch = cracked, "cracked"
+    return InteractionPoint(p, moment / 1_000_000.0, c, branch)
+
+
 def _unreinforced_curve(
     wall: WallInput,
     section: SectionProperties,
     samples: int,
 ) -> tuple[tuple[InteractionPoint, ...], float]:
     cap = _axial_cap(wall, section)
-    segment = section.segments[0]
-    stress = 0.85 * PHI_M * segment.fm
     curve: list[InteractionPoint] = []
     for index in range(samples + 1):
-        p = cap * index / samples
-        p_n = p * 1000.0
-        compression_limit = (
-            0.60 * PHI_M * segment.fm - p_n / section.area
-        ) * section.section_modulus
-        tension_limit = (
-            PHI_M * section.ft + p_n / section.area
-        ) * section.section_modulus
-        uncracked = max(0.0, min(compression_limit, tension_limit))
-        if p_n == 0.0:
-            cracked = 0.0
-            c = 0.0
-        else:
-            block_depth = p_n / (stress * segment.effective_thickness)
-            c = block_depth / beta_one(segment.fm)
-            raw = p_n * (section.centroid - block_depth / 2.0)
-            cracked = min(raw, p_n * ECCENTRICITY_LIMIT * wall.length)
-        if uncracked >= cracked:
-            moment = uncracked
-            branch = "uncracked"
-        else:
-            moment = cracked
-            branch = "cracked"
-        curve.append(InteractionPoint(p, moment / 1_000_000.0, c, branch))
+        curve.append(_unreinforced_point(wall, section, cap * index / samples))
     curve.append(InteractionPoint(cap, 0.0, None, "axial-cap"))
     return tuple(curve), cap
 
@@ -835,7 +905,7 @@ def interaction_curve(
     section: SectionProperties | None = None,
     samples: int = 1200,
 ) -> tuple[tuple[InteractionPoint, ...], float]:
-    if samples < 100:
+    if type(samples) is not int or samples < 100:
         raise CalculationError("At least 100 interaction samples are required.")
     section = section or section_properties(wall)
     if wall.wall_type == "Unreinforced masonry":
@@ -873,12 +943,7 @@ def _shear_result(
     fm = section.weighted_fm
     gamma = section.gamma_g
     pd = pd_kN * 1000.0
-    provided_av = (
-        wall.horizontal_reinforcement_area
-        if wall.horizontal_reinforcement_type != "None"
-        else 0.0
-    )
-    av = provided_av if wall.horizontal_anchorage_confirmed else 0.0
+    av = _horizontal_area_credited(wall, section)
     spacing = wall.horizontal_reinforcement_spacing
     horizontal_fy = wall.horizontal_fy
     reinforced = wall.wall_type != "Unreinforced masonry"
@@ -917,31 +982,35 @@ def _shear_result(
                 lever_value,
             )
 
-        if wall.wall_type == "Partially grouted reinforced masonry":
+        if section.grouted_length_fraction < 1.0 - 1.0e-8:
             beta_simplified = beta_general = 0.16 * (2.0 - ratio) + 0.25 * pd / (
                 math.sqrt(fm) * wall.thickness * dv
             )
             theta_simplified = theta_general = 59.0
         else:
+            candidate_zs = min(dv, section.bar_spacing or dv)
+            vertical_area = BAR_AREAS[wall.bar_size]
+            vertical_ld = _development_length(wall, section, horizontal=False) or 1.0
+            developed_fraction = min(1.0, wall.available_vertical_development / vertical_ld)
+            if not wall.vertical_bars_continuous:
+                developed_fraction = min(developed_fraction, wall.available_termination_extension / vertical_ld)
+            zs = (
+                candidate_zs
+                if vertical_area * developed_fraction >= 0.002 * wall.thickness * candidate_zs
+                else dv
+            )
             beta_simplified = (
                 0.18
                 if av >= minimum_av_2024
-                else 230.0 / (1000.0 + 1.4 * dv)
+                else 230.0 / (1000.0 + 1.4 * zs)
             )
             theta_simplified = 42.0
-            candidate_zs = min(dv, section.bar_spacing or dv)
-            vertical_area = BAR_AREAS[wall.bar_size]
-            zs = (
-                candidate_zs
-                if vertical_area >= 0.002 * wall.thickness * candidate_zs
-                else dv
-            )
             ze = (
                 300.0
                 if av >= minimum_av_2024
                 else (1.4 if wall.grout_type == "Coarse" else 1.7) * zs
             )
-            tension_half_area = BAR_AREAS[wall.bar_size] * sum(
+            tension_half_area = developed_fraction * BAR_AREAS[wall.bar_size] * sum(
                 position >= section.centroid for position in section.bar_positions
             )
             design_moment = max(
@@ -1006,7 +1075,11 @@ def _shear_result(
         )
         uncapped = masonry + steel
         aspect = min(1.0, max(0.5, wall.height / wall.length))
-        squat_factor = 2.0 - aspect if wall.height / wall.length < 1.0 else 1.0
+        squat_factor = (
+            2.0 - aspect
+            if wall.height / wall.length < 1.0 and wall.squat_shear_distribution_confirmed
+            else 1.0
+        )
         maximum = (
             0.40
             * PHI_M
@@ -1027,12 +1100,14 @@ def _shear_result(
             if reinforced
             else None
         )
+    stack_resistance = None
     if wall.bond_pattern == "Stack pattern":
-        ch = PHI_S * av * horizontal_fy
-        stack_limit = (PHI_M * 0.7 if wall.edition == "S304-14" else 1.0) * ch
-        maximum = min(maximum, stack_limit)
-        resistance = min(resistance, maximum)
-        method += "; stack-pattern head-joint limit"
+        # This is a vertical interface action, not the horizontal diagonal Vf.
+        # Ch uses the total developed area crossing the assessed head joint.
+        ch = PHI_S * (wall.stack_joint_area or 0.0) * horizontal_fy if av > 0.0 else 0.0
+        stack_resistance = (PHI_M * 0.7 if wall.edition == "S304-14" else 1.0) * ch / 1000.0
+    if wall.factored_shear * 1000.0 > maximum + 1.0e-8:
+        required = None  # More horizontal steel cannot cure the masonry shear cap.
     return ShearResult(
         effective_depth=dv,
         moment_shear_ratio=ratio,
@@ -1050,6 +1125,7 @@ def _shear_result(
         epsilon_x=epsilon_x,
         ze=ze,
         method=method,
+        stack_vertical_resistance=stack_resistance,
     )
 
 
@@ -1066,16 +1142,22 @@ def _sliding_result(
             else len(section.bar_positions)
         )
     developed_area = developed_count * BAR_AREAS[wall.bar_size]
+    ld = _development_length(wall, section, horizontal=False) or 0.0
+    if wall.available_vertical_development < ld:
+        developed_area = 0.0
     pd = pd_kN * 1000.0
-    clamping = pd + PHI_S * developed_area * wall.fy
+    # Under net uplift, equilibrium leaves only steel force minus uplift to
+    # clamp the joint; dead load cannot be counted a second time.
+    normal_force = wall.factored_axial * 1000.0 if wall.factored_axial < 0.0 else pd
+    clamping = max(0.0, normal_force + PHI_S * developed_area * wall.fy)
     edition_factor = PHI_M if wall.edition == "S304-14" else 1.0
     reinforced_route = edition_factor * wall.sliding_friction * clamping
-    uncracked_area = wall.uncracked_area_fraction * section.area
+    uncracked_area = wall.uncracked_area_fraction * section.area if normal_force >= 0.0 else 0.0
     bond_route: float | None = None
     if wall.sliding_plane == "Between masonry courses":
         bond_route = (
             0.16 * PHI_M * math.sqrt(section.weighted_fm) * uncracked_area
-            + edition_factor * wall.sliding_friction * pd
+            + edition_factor * wall.sliding_friction * max(0.0, normal_force)
         )
         resistance = max(reinforced_route, bond_route)
         method = "greater of separate reinforced-friction and uncracked-bond routes"
@@ -1089,7 +1171,7 @@ def _sliding_result(
             (
                 wall.factored_shear * 1000.0
                 / (edition_factor * wall.sliding_friction)
-                - pd
+                - normal_force
             )
             / (PHI_S * wall.fy),
         )
@@ -1122,7 +1204,8 @@ def _checks(
     def add(ok: bool, title: str, detail: str, clause: str) -> None:
         checks.append(Check("pass" if ok else "blocked", title, detail, clause))
 
-    flex_clause = "10.2 / 10.4" if wall.edition == "S304-14" else "11.2 / 11.4"
+    flex_prefix = ("7" if wall.edition == "S304-14" else "8") if wall.wall_type == "Unreinforced masonry" else ("10" if wall.edition == "S304-14" else "11")
+    flex_clause = f"{flex_prefix}.2 / {flex_prefix}.4"
     if wall.factored_axial >= 0.0:
         add(
             wall.factored_axial <= axial_cap + 1.0e-8,
@@ -1213,6 +1296,13 @@ def _checks(
             "12.4.2.3" if wall.edition == "S304-14" else "13.4.2.3",
         )
         if wall.splice_present and detailing.lap_required is not None:
+            if wall.splice_class == "A":
+                add(
+                    wall.class_a_splice_confirmed,
+                    "Class A splice eligibility",
+                    "Requires at least twice the steel area required by analysis and no more than 50% spliced within the lap length.",
+                    "12.5.4.1" if wall.edition == "S304-14" else "13.5.4.1 / Table 11",
+                )
             add(
                 wall.provided_lap_length >= detailing.lap_required - 1.0e-8,
                 f"Class {wall.splice_class} tension lap splice",
@@ -1238,10 +1328,10 @@ def _checks(
                 wall.thickness,
             )
             add(
-                wall.tie_diameter >= 3.65 - 1.0e-8 and wall.tie_spacing <= tie_limit + 1.0e-8,
+                _ties_qualify(wall),
                 "Compression-reinforcement ties",
-                f"Tie diameter = {wall.tie_diameter:.2f} mm (minimum 3.65); spacing = {wall.tie_spacing:.0f} mm (limit {tie_limit:.0f}).",
-                "12.2.1" if wall.edition == "S304-14" else "13.2.1",
+                f"Tie diameter = {wall.tie_diameter:.2f} mm (minimum 3.65); spacing = {wall.tie_spacing:.0f} mm (limit {tie_limit:.0f}); tie arrangement confirmed = {wall.tie_arrangement_confirmed}. Compression steel is credited only if all conditions pass.",
+                "12.2" if wall.edition == "S304-14" else "13.2",
             )
 
         if wall.horizontal_reinforcement_type == "Bond beam bars":
@@ -1253,8 +1343,14 @@ def _checks(
         else:
             maximum_spacing = math.inf
         if wall.horizontal_reinforcement_type != "None":
+            add(
+                wall.horizontal_reinforcement_area > 0.0,
+                "Horizontal reinforcement area supplied",
+                f"Av = {wall.horizontal_reinforcement_area:.1f} mm2 at each level.",
+                "Reinforcement layout",
+            )
             horizontal_ratio = wall.horizontal_reinforcement_area / (
-                wall.thickness * wall.horizontal_reinforcement_spacing
+                wall.thickness * min(wall.horizontal_reinforcement_spacing, 4.0 * wall.thickness)
             )
             add(
                 horizontal_ratio <= 0.02 + 1.0e-12,
@@ -1318,7 +1414,7 @@ def _checks(
 
     if wall.wall_type == "Unreinforced masonry" and wall.horizontal_reinforcement_type != "None":
         unreinforced_horizontal_ratio = wall.horizontal_reinforcement_area / (
-            wall.thickness * wall.horizontal_reinforcement_spacing
+            wall.thickness * min(wall.horizontal_reinforcement_spacing, 4.0 * wall.thickness)
         )
         add(
             unreinforced_horizontal_ratio <= 0.02 + 1.0e-12,
@@ -1371,12 +1467,27 @@ def _checks(
             )
 
     if wall.bond_pattern == "Stack pattern":
+        stack_spacing = 800.0 if wall.horizontal_reinforcement_type == "Bond beam bars" else 400.0
         add(
-            wall.horizontal_reinforcement_type != "None"
-            and wall.horizontal_anchorage_confirmed
-            and wall.horizontal_continuity_confirmed,
+            _horizontal_area_credited(wall, section) > 0.0
+            and wall.horizontal_reinforcement_spacing <= stack_spacing,
             "Stack-pattern head-joint reinforcement",
-            "Continuous developed horizontal reinforcement is required across every continuous head joint.",
+            f"Continuous developed horizontal reinforcement is required; maximum spacing = {stack_spacing:.0f} mm.",
+            "10.10.4" if wall.edition == "S304-14" else "11.10.4",
+        )
+        if wall.stack_joint_area is not None:
+            maximum_crossing_area = wall.horizontal_reinforcement_area * (math.floor(wall.height / wall.horizontal_reinforcement_spacing) + 1)
+            add(
+                wall.stack_joint_area <= maximum_crossing_area + 1.0e-8,
+                "Stack-joint crossing area consistency",
+                f"Entered total = {wall.stack_joint_area:.1f} mm2; upper bound from wall height, Av and spacing = {maximum_crossing_area:.1f} mm2.",
+                "Reinforcement layout",
+            )
+        add(
+            wall.stack_vertical_shear is not None and wall.stack_joint_area is not None
+            and wall.stack_vertical_shear <= (shear.stack_vertical_resistance or 0.0) + 1.0e-8,
+            "Stack-pattern vertical joint shear",
+            f"Vertical joint demand = {wall.stack_vertical_shear} kN; resistance = {shear.stack_vertical_resistance:.2f} kN. Enter the total area and vertical shear for the same assessed head-joint length.",
             "10.10.4" if wall.edition == "S304-14" else "11.10.4",
         )
 
@@ -1394,12 +1505,13 @@ def _checks(
         "Base force transfer and reinforcement continuity are confirmed." if wall.base_connection_confirmed else "Confirm base force transfer, dowels, development, and foundation interface details.",
         "Wall-level connection",
     )
-    add(
-        wall.top_connection_confirmed,
-        "Wall-to-floor/roof connection",
-        "Top lateral-load transfer and vertical continuity are confirmed." if wall.top_connection_confirmed else "Confirm top lateral-load transfer, anchorage, and vertical continuity.",
-        "Wall-level connection",
-    )
+    if not wall.free_standing:
+        add(
+            wall.top_connection_confirmed,
+            "Wall-to-floor/roof connection",
+            "Top lateral-load transfer and vertical continuity are confirmed." if wall.top_connection_confirmed else "Confirm top lateral-load transfer, anchorage, and vertical continuity.",
+            "Wall-level connection",
+        )
     add(
         stability.oop_check_provided,
         "Concurrent minor-axis/OOP check supplied",
@@ -1417,7 +1529,11 @@ def _checks(
             stability.combined_utilization is not None
             and stability.combined_utilization <= 1.0 + 1.0e-8,
             "Conservative major/minor interaction screen",
-            f"In-plane utilization + OOP utilization = {stability.combined_utilization:.3f}; limit = 1.000.",
+            (
+                f"In-plane utilization + OOP utilization = {stability.combined_utilization:.3f}; limit = 1.000."
+                if stability.combined_utilization is not None
+                else "No combined resistance is available at the entered axial load and moment."
+            ),
             "Rational wall-level interaction screen",
         )
     checks.append(
@@ -1440,16 +1556,38 @@ def _checks(
     return tuple(checks)
 
 
+def demand_utilization(demand: float, resistance: float | None) -> float | None:
+    if resistance is None or resistance < 0.0:
+        return None
+    return demand / resistance if resistance > 0.0 else (0.0 if demand == 0.0 else None)
+
+
+def _moment_resistance_at_demand(wall: WallInput, section: SectionProperties) -> float | None:
+    axial = wall.factored_axial
+    tension_cap = _tension_cap(wall, section)
+    if axial < -tension_cap or axial > _axial_cap(wall, section):
+        return None
+    if wall.wall_type == "Unreinforced masonry":
+        return _unreinforced_point(wall, section, axial).m
+    if axial == -tension_cap:
+        return 0.0
+    lower = 1.0e-9
+    upper = wall.length / min(beta_one(s.fm) for s in section.segments)
+    while section_point_at_c(wall, upper, section).p < axial:
+        upper *= 2.0
+    for _ in range(70):
+        middle = (lower + upper) / 2.0
+        if section_point_at_c(wall, middle, section).p < axial:
+            lower = middle
+        else:
+            upper = middle
+    return section_point_at_c(wall, (lower + upper) / 2.0, section).m
+
+
 def calculate_wall(wall: WallInput) -> WallResult:
     physical_section = section_properties(wall, "Discrete")
     discrete_curve, discrete_cap = interaction_curve(wall, physical_section)
-    discrete_mr = (
-        moment_at_axial_load(discrete_curve, wall.factored_axial)
-        if -_tension_cap(wall, physical_section) - 1.0e-8
-        <= wall.factored_axial
-        <= discrete_cap + 1.0e-8
-        else None
-    )
+    discrete_mr = _moment_resistance_at_demand(wall, physical_section)
     section = physical_section
     curve = discrete_curve
     cap = discrete_cap
@@ -1459,13 +1597,7 @@ def calculate_wall(wall: WallInput) -> WallResult:
     if wall.wall_type == "Partially grouted reinforced masonry":
         smeared_section = section_properties(wall, "Smeared")
         smeared_curve, smeared_cap = interaction_curve(wall, smeared_section)
-        smeared_mr = (
-            moment_at_axial_load(smeared_curve, wall.factored_axial)
-            if -_tension_cap(wall, smeared_section) - 1.0e-8
-            <= wall.factored_axial
-            <= smeared_cap + 1.0e-8
-            else None
-        )
+        smeared_mr = _moment_resistance_at_demand(wall, smeared_section)
         if wall.partial_grout_method == "Smeared":
             section, curve, cap, moment_resistance = (
                 smeared_section,
@@ -1487,21 +1619,13 @@ def calculate_wall(wall: WallInput) -> WallResult:
             else:
                 moment_resistance = discrete_mr
     tension_cap = _tension_cap(wall, section)
-    pm_utilization = (
-        wall.factored_moment / moment_resistance
-        if moment_resistance is not None and moment_resistance > 0.0
-        else None
-    )
+    pm_utilization = demand_utilization(wall.factored_moment, moment_resistance)
     self_weight = _wall_self_weight(wall, physical_section)
     pd = _pd(wall, self_weight)
     shear = _shear_result(wall, physical_section, pd)
     sliding = _sliding_result(wall, physical_section, pd)
     detailing = _detailing_result(wall, physical_section)
-    sliding_utilization = (
-        wall.factored_shear / sliding.resistance
-        if sliding.resistance > 0.0
-        else None
-    )
+    sliding_utilization = demand_utilization(wall.factored_shear, sliding.resistance)
     stability = StabilityResult(
         combined_utilization=(
             pm_utilization + wall.oop_utilization
@@ -1524,7 +1648,7 @@ def calculate_wall(wall: WallInput) -> WallResult:
         self_weight,
         pd,
     )
-    flex_clause = "10" if wall.edition == "S304-14" else "11"
+    flex_clause = ("7" if wall.edition == "S304-14" else "8") if wall.wall_type == "Unreinforced masonry" else ("10" if wall.edition == "S304-14" else "11")
     shear_clause = (
         "7.10" if wall.wall_type == "Unreinforced masonry" else "10.10"
     ) if wall.edition == "S304-14" else (
@@ -1536,8 +1660,8 @@ def calculate_wall(wall: WallInput) -> WallResult:
         TraceEntry("f'm,eff", f"{section.weighted_fm:.3f}", "MPa", "sum(f'm,i Ai) / Ae", "Table 4 partial-grout note"),
         TraceEntry("Ae", f"{section.area:.1f}", "mm2", "mortar-bedded area plus grouted void area", f"{flex_clause}.3"),
         TraceEntry("gamma_g", f"{section.gamma_g:.4f}", "-", "1.0 fully grouted; otherwise min(Ae/Ag, 0.5)", shear_clause),
-        TraceEntry("Pr,max", f"{cap:.3f}", "kN", "0.80 sum(0.85 phi_m f'm,i Ai)", f"{flex_clause}.4"),
-        TraceEntry("Mr(Pf)", "-" if moment_resistance is None else f"{moment_resistance:.3f}", "kN-m", "strain-compatible P-M envelope", f"{flex_clause}.2"),
+        TraceEntry("Pr,max", f"{cap:.3f}", "kN", "0.80 [sum(0.85 phi_m f'm,i Ai) + eligible compression-steel net force]", f"{flex_clause}.4"),
+        TraceEntry("Mr(Pf)", "-" if moment_resistance is None else f"{moment_resistance:.3f}", "kN-m", "elastic/cracked section envelope" if wall.wall_type == "Unreinforced masonry" else "strain-compatible P-M curve; reduced arm for squat walls", f"{flex_clause}.2"),
         TraceEntry("dv", f"{shear.effective_depth:.1f}", "mm", "0.8 lw", shear_clause),
         TraceEntry("M/(Vdv)", f"{shear.moment_shear_ratio:.4f}", "-", "limited to 0.25 through 1.0", shear_clause),
         TraceEntry("Vm", f"{shear.masonry_resistance:.3f}", "kN", shear.method, shear_clause),
@@ -1550,6 +1674,7 @@ def calculate_wall(wall: WallInput) -> WallResult:
         TraceEntry("epsilon_x", "-" if shear.epsilon_x is None else f"{shear.epsilon_x:.7f}", "-", "S304:24 general shear method", shear_clause),
         TraceEntry("ze", "-" if shear.ze is None else f"{shear.ze:.3f}", "mm", "S304:24 general shear method", shear_clause),
         TraceEntry("Vr,slide", f"{sliding.resistance:.3f}", "kN", sliding.method, shear_clause + ".5"),
+        TraceEntry("Vr,vertical joint", "-" if shear.stack_vertical_resistance is None else f"{shear.stack_vertical_resistance:.3f}", "kN", "stack-pattern vertical joint resistance; checked separately from horizontal Vf", shear_clause + ".4"),
         TraceEntry("vertical ld", f"{detailing.vertical_development_required:.3f}", "mm", "CSA straight deformed-bar development", "12.4.2.3" if wall.edition == "S304-14" else "13.4.2.3"),
     )
     return WallResult(
@@ -1591,6 +1716,7 @@ __all__ = [
     "WallResult",
     "beta_one",
     "calculate_wall",
+    "demand_utilization",
     "interaction_curve",
     "masonry_strengths",
     "moment_at_axial_load",

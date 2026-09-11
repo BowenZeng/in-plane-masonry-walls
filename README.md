@@ -7,14 +7,15 @@ Independent Streamlit design aid comparing CSA S304-14 and CSA S304:24 for recta
 - Unreinforced hollow, fully grouted hollow, or solid-unit masonry.
 - Fully grouted reinforced masonry.
 - Partially grouted reinforced masonry using discrete and smeared methods with a lower-result option.
-- Strain-compatible P-M interaction diagrams with multiple vertical bars.
+- Strain-compatible P-M interaction diagrams with multiple vertical bars, with direct force-equilibrium solutions at the entered axial load.
 - Compression and axial-tension demands for reinforced walls, tied compression reinforcement, and squat-wall effective-depth treatment that cannot increase resistance.
-- S304:24 simplified and general in-plane shear methods, 2014 shear, stack-pattern limits, bond-beam or joint reinforcement, and transparent beta/theta components.
+- S304:24 simplified and general in-plane shear methods, 2014 shear, separate stack-pattern vertical joint checks, and bond-beam or joint reinforcement.
 - Base or between-course sliding shear, uncracked masonry bond, developed vertical steel, and required dowel area.
-- Calculated wall self-weight and code-defined Pd with a direct override.
+- Calculated wall self-weight above the checked section and code-defined Pd with a direct override. Net uplift reduces sliding-plane clamping.
 - Vertical/horizontal reinforcement area and spacing, development, anchorage, lap, termination, tie, wire-size, and masonry-clearance checks.
 - Wall-to-foundation and wall-to-floor/roof confirmation gates.
-- Required wall-level interface to the existing OOP tool for concurrent minor-axis utilization and weak-axis stability.
+- Required wall-level interface to the existing OOP tool for concurrent minor-axis utilization and weak-axis stability, with a separate utilization for each edition.
+- Free-standing-wall tensile limits, prior cracking of unreinforced walls, and explicit tie and Class A splice eligibility.
 
 The current release intentionally excludes flanged walls, openings, coupled walls, infill-frame action, building-level load distribution and torsion, and seismic system classification/capacity design.
 
@@ -30,10 +31,15 @@ python -m streamlit run streamlit_app.py
 ```powershell
 python -m unittest discover -s tests -v
 python verify_in_plane.py
+python verify_independent.py
 python -m py_compile in_plane_engine.py streamlit_app.py
 ```
 
-The 40-case verification matrix covers cantilever and fixed-fixed demand patterns, squat and tall walls, compression and uplift, every supported grouting condition, both sliding planes, stack pattern, bond-beam and joint reinforcement, and deliberate detailing/connection failures. The unit tests reproduce the supplied fully grouted, partially grouted, squat-wall, unreinforced, self-weight, and in-plane-shear examples within calculation-rounding tolerance. The engine uses the code value `0.33` for the unreinforced eccentricity limit; hand examples that substitute `1/3` will differ slightly.
+The 40-case verification matrix covers prescribed cantilever and fixed-fixed section actions, squat and tall walls, compression and uplift, supported grouting conditions, both sliding planes, stack pattern, bond-beam and joint reinforcement, and deliberate detailing/connection failures. A separate solver checks 1,056 material, geometry, loading, flexural, and shear combinations independently of the production helpers. The regression suite includes real Streamlit input transitions and chart checks.
+
+The app checks the entered wall-section actions; it does not solve a building or derive member actions from support conditions. Enter concurrent factored actions, including applicable second-order effects. OOP stability, connection force transfer, and detailed reinforcement layout remain explicit designer inputs. Sampled P-M CSV points describe plotted curves; the design check uses direct equilibrium. For the partial-grout lower option, the selected curve is the method governing at the entered Pf, with the other method shown for comparison.
+
+The engine uses `0.33` for the unreinforced cracked-section eccentricity limit; reference examples that substitute `1/3` differ slightly. The audit uses the supplied 2014 and April 2024 standards. The June 2025 errata were explicitly deferred by the project owner; this release does not claim to include them. See [the technical audit](docs/validation-2026-09-11.md) for the basis, corrections, checks, and remaining model limits.
 
 ## Deployment
 

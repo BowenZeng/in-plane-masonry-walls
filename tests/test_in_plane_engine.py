@@ -344,6 +344,7 @@ class InPlaneEngineTests(unittest.TestCase):
             replace(
                 self.example,
                 compression_reinforcement_tied=True,
+                tie_arrangement_confirmed=True,
                 tie_spacing=150.0,
             )
         )
@@ -351,7 +352,7 @@ class InPlaneEngineTests(unittest.TestCase):
         tie_check = next(c for c in tied.checks if c.title == "Compression-reinforcement ties")
         self.assertEqual(tie_check.level, "pass")
 
-    def test_stack_pattern_applies_head_joint_limit(self) -> None:
+    def test_stack_pattern_checks_vertical_joint_separately(self) -> None:
         result = calculate_wall(
             replace(
                 self.example,
@@ -360,10 +361,15 @@ class InPlaneEngineTests(unittest.TestCase):
                 horizontal_reinforcement_area=200.0,
                 horizontal_anchorage_confirmed=True,
                 horizontal_continuity_confirmed=True,
+                stack_joint_area=1000.0,
+                stack_vertical_shear=150.0,
             )
         )
-        expected = 0.60 * 0.70 * 0.85 * 200.0 * 400.0 / 1000.0
-        self.assertAlmostEqual(result.shear.resistance, expected, places=6)
+        expected = 0.60 * 0.70 * 0.85 * 1000.0 * 400.0 / 1000.0
+        self.assertAlmostEqual(result.shear.stack_vertical_resistance, expected, places=6)
+        self.assertGreater(result.shear.resistance, expected)
+        check = next(c for c in result.checks if c.title == "Stack-pattern vertical joint shear")
+        self.assertEqual(check.level, "blocked")
 
     def test_oop_interface_blocks_until_linked_and_checks_combined_utilization(self) -> None:
         missing = calculate_wall(self.example)
