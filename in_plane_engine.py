@@ -199,7 +199,12 @@ class WallInput:
     unreinforced_precracked: bool = False
     partial_grout_method: str = "Use lower of discrete and smeared"
     unit_geometry_confirmed: bool = False
-    face_shell_thickness: float = 36.2
+    # Mortar-bedded face-shell thickness (mm): S304-14 Ae and the clear-cell
+    # bound. S304:24 Ae uses the Clause 3.1 minimum face-shell thickness.
+    # None = not declared: the unverified UNIT_FACE_SHELL_REFERENCE value is
+    # used and ip.unit_face_shell_declared is INCOMPLETE (register I-14).
+    face_shell_thickness: float | None = None
+    minimum_face_shell_thickness: float | None = None
     grouted_cell_width: float = 200.0
     bar_size: str = "15M"
     bar_count: int = 5
@@ -278,6 +283,8 @@ class Segment:
 
 @dataclass(frozen=True)
 class SectionProperties:
+    # face_shell_thickness / face_shell_source: the tf used for the ungrouted
+    # segments in this edition (None when the section has none).
     area: float
     gross_area: float
     centroid: float
@@ -293,6 +300,9 @@ class SectionProperties:
     fm_grouted: float
     ft: float
     segments: tuple[Segment, ...]
+    face_shell_thickness: float | None = None
+    face_shell_source: str = ""
+    face_shell_declared: bool = True
 
 
 @dataclass(frozen=True)
@@ -422,8 +432,10 @@ def _interpolate_strength(
     values: dict[float, tuple[float, float]],
 ) -> tuple[float, float]:
     ordered = sorted(values.items())
-    if not ordered[0][0] <= strength <= ordered[-1][0]:
+    if not strength >= ordered[0][0]:
         raise CalculationError("Nominal unit strength is outside the supported Table 4 range.")
+    if strength >= ordered[-1][0]:
+        return ordered[-1][1]  # Table 4 top row is printed "30 or more" (F-041).
     for (x0, y0), (x1, y1) in zip(ordered, ordered[1:]):
         if x0 <= strength <= x1:
             fraction = (strength - x0) / (x1 - x0)
@@ -438,13 +450,50 @@ def masonry_strengths(wall: WallInput) -> tuple[float, float]:
     )
 
 
+def _reference_face_shell(kind: str, thickness: float) -> float:
+    value = UNIT_FACE_SHELL_REFERENCE[kind].get(float(thickness))
+    if value is None:
+        raise CalculationError(
+            f"No reference {kind.replace('_', '-')} face-shell thickness for t = {thickness:g} mm; "
+            "declare the unit's face-shell thicknesses.")
+    return value
+
+
+def _section_tf(wall: WallInput) -> tuple[float, str, bool]:
+    """(tf, source, declared) used for ungrouted segments in this edition.
+
+    S304-14 takes the mortar-bedded face shell; S304:24 takes the Clause 3.1
+    minimum face-shell thickness. A missing value falls back to the unverified
+    reference table and is reported as not declared (register I-14).
+    """
+    if wall.edition == "S304:24":
+        value, kind, label = wall.minimum_face_shell_thickness, "minimum", "S304:24 3.1 minimum face-shell thickness"
+    else:
+        value, kind, label = wall.face_shell_thickness, "mortar_bedded", "mortar-bedded face-shell thickness"
+    if value is not None:
+        return value, f"declared {label}", True
+    return (_reference_face_shell(kind, wall.thickness),
+            f"reference {label} for t = {wall.thickness:g} mm (comparison workbook; unverified, register I-14)", False)
+
+
+def resolved_face_shell_thickness(wall: WallInput) -> float:
+    """Face-shell thickness of this edition's ungrouted section, in mm (F-061)."""
+    return _section_tf(wall)[0]
+
+
+def _bedded_tf(wall: WallInput) -> float:
+    """Mortar-bedded face shell: declared, else the reference value (the clear-cell bound only)."""
+    if wall.face_shell_thickness is not None:
+        return wall.face_shell_thickness
+    return _reference_face_shell("mortar_bedded", wall.thickness)
+
+
 def _validate(wall: WallInput) -> None:
     positive = {
         "length": wall.length,
         "height": wall.height,
         "thickness": wall.thickness,
         "nominal unit strength": wall.nominal_unit_strength,
-        "face-shell thickness": wall.face_shell_thickness,
         "horizontal reinforcement spacing": wall.horizontal_reinforcement_spacing,
         "steel yield strength": wall.fy,
         "horizontal steel yield strength": wall.horizontal_fy,
@@ -509,8 +558,15 @@ def _validate(wall: WallInput) -> None:
         "Partially grouted reinforced masonry",
     ):
         raise CalculationError(f"Unsupported wall type: {wall.wall_type}.")
-    if wall.face_shell_thickness * 2.0 >= wall.thickness:
-        raise CalculationError("Two face shells must leave a positive hollow core width.")
+    for name, value in (("Mortar-bedded face-shell thickness", wall.face_shell_thickness),
+                        ("Minimum face-shell thickness", wall.minimum_face_shell_thickness)):
+        if value is not None and (not math.isfinite(value) or value <= 0.0):
+            raise CalculationError(f"{name} must be positive and finite.")
+        if value is not None and value * 2.0 >= wall.thickness:
+            raise CalculationError(f"{name}: two face shells must leave a positive hollow core width.")
+    if (wall.face_shell_thickness is not None and wall.minimum_face_shell_thickness is not None
+            and wall.minimum_face_shell_thickness > wall.face_shell_thickness + 1.0e-9):
+        raise CalculationError("The minimum face-shell thickness cannot exceed the mortar-bedded face-shell thickness.")
     if not 0.0 < wall.sliding_friction <= 1.0:
         raise CalculationError("Sliding friction must be greater than zero and no greater than 1.0.")
     if wall.fy > 400.0:
@@ -584,6 +640,7 @@ def _partial_segments(
     fm_ungrouted: float,
     fm_grouted: float,
     positions: tuple[float, ...],
+    face_shell: float,
 ) -> tuple[Segment, ...]:
     half = wall.grouted_cell_width / 2.0
     intervals = [
@@ -599,7 +656,7 @@ def _partial_segments(
             Segment(
                 x0,
                 x1,
-                wall.thickness if grouted else 2.0 * wall.face_shell_thickness,
+                wall.thickness if grouted else 2.0 * face_shell,
                 fm_grouted if grouted else fm_ungrouted,
                 grouted,
             )
@@ -611,14 +668,19 @@ def section_properties(wall: WallInput, method: str | None = None) -> SectionPro
     _validate(wall)
     fm_ungrouted, fm_grouted = masonry_strengths(wall)
     positions = _bar_positions(wall)
+    uses_face_shell = wall.wall_type == "Partially grouted reinforced masonry" or (
+        wall.wall_type == "Unreinforced masonry" and wall.unreinforced_condition == "Hollow ungrouted")
+    tf, tf_source, tf_declared = _section_tf(wall) if uses_face_shell else (None, "", True)
     if wall.wall_type == "Fully grouted reinforced masonry":
         discrete_segments = (Segment(0.0, wall.length, wall.thickness, fm_grouted, True),)
     elif wall.wall_type == "Partially grouted reinforced masonry":
-        discrete_segments = _partial_segments(wall, fm_ungrouted, fm_grouted, positions)
+        discrete_segments = _partial_segments(wall, fm_ungrouted, fm_grouted, positions, tf)
+        if all(s.grouted for s in discrete_segments):
+            tf, tf_source, tf_declared = None, "", True  # cells fill the length: no face shell in Ae
     else:
         if wall.unreinforced_condition == "Hollow ungrouted":
             discrete_segments = (
-                Segment(0.0, wall.length, 2.0 * wall.face_shell_thickness, fm_ungrouted, False),
+                Segment(0.0, wall.length, 2.0 * tf, fm_ungrouted, False),
             )
         else:
             discrete_segments = (
@@ -695,6 +757,9 @@ def section_properties(wall: WallInput, method: str | None = None) -> SectionPro
         fm_grouted=fm_grouted,
         ft=0.1 if wall.free_standing else _FT_TABLE[wall.unreinforced_condition][wall.mortar_type],
         segments=segments,
+        face_shell_thickness=tf,
+        face_shell_source=tf_source,
+        face_shell_declared=tf_declared,
     )
 
 
@@ -1867,11 +1932,27 @@ def _checks(
             tolerance=1e-8,
         )
 
+    if section.face_shell_thickness is not None:
+        add(
+            section.face_shell_declared,
+            "Unit face-shell thickness declared",
+            f"tf = {section.face_shell_thickness:.1f} mm for the ungrouted effective area ({section.face_shell_source})."
+            + ("" if section.face_shell_declared else
+               " Declare the unit's face-shell thickness: CSA A165.1 was not supplied and the reference value is unverified."),
+            ("10.3; Table 4 Note 2" if wall.edition == "S304-14" else "11.3; 3.1 (minimum face-shell thickness)")
+            if wall.wall_type != "Unreinforced masonry" else ("7.3" if wall.edition == "S304-14" else "8.3; 3.1"),
+            check_id="ip.unit_face_shell_declared",
+            kind="numeric",
+            unresolved="incomplete",
+        )
     if wall.wall_type == "Partially grouted reinforced masonry":
+        tf_text = ("" if section.face_shell_thickness is None else
+                   f" tf used in this edition = {section.face_shell_thickness:.1f} mm ({section.face_shell_source}).")
         add(
             wall.unit_geometry_confirmed,
             "Partial-grout unit geometry",
-            "Face-shell thickness, cell width, mortar-bedded area, and grout layout are confirmed." if wall.unit_geometry_confirmed else "Confirm face-shell thickness, cell width, mortar-bedded area, and grout layout.",
+            ("Face-shell thickness, cell width, mortar-bedded area, and grout layout are confirmed." if wall.unit_geometry_confirmed else "Confirm face-shell thickness, cell width, mortar-bedded area, and grout layout.")
+            + tf_text,
             "Table 4 Notes 2-3" if wall.edition == "S304-14" else "Table 4 Note 3",
             check_id="ip.partial_grout_unit_geometry",
             kind="review",
@@ -2074,11 +2155,16 @@ def calculate_wall(wall: WallInput) -> WallResult:
     ) if wall.edition == "S304-14" else (
         "8.10" if wall.wall_type == "Unreinforced masonry" else "11.10"
     )
+    table4_row = "; Table 4 row '30 or more'" if wall.nominal_unit_strength >= 30.0 else ""
     trace = (
-        TraceEntry("f'm,ug", f"{section.fm_ungrouted:.3f}", "MPa", "CSA Table 4 concrete-block value", "Table 4"),
-        TraceEntry("f'm,g", f"{section.fm_grouted:.3f}", "MPa", "CSA Table 4 grouted-block value", "Table 4"),
+        TraceEntry("f'm,ug", f"{section.fm_ungrouted:.3f}", "MPa", "CSA Table 4 concrete-block value" + table4_row, "Table 4"),
+        TraceEntry("f'm,g", f"{section.fm_grouted:.3f}", "MPa", "CSA Table 4 grouted-block value" + table4_row, "Table 4"),
         TraceEntry("f'm,eff", f"{section.weighted_fm:.3f}", "MPa", "sum(f'm,i Ai) / Ae", "Table 4 partial-grout note"),
         TraceEntry("Ae", f"{section.area:.1f}", "mm2", "mortar-bedded area plus grouted void area", f"{flex_clause}.3"),
+        TraceEntry("tf (Ae)", _fmt(section.face_shell_thickness, 1), "mm",
+                   section.face_shell_source or "no ungrouted segment in this section", f"{flex_clause}.3"),
+        TraceEntry("least clear cell", f"{wall.least_clear_cell_dimension:.1f}", "mm", "declared least clear dimension of the reinforced cell",
+                   "12.1.3" if wall.edition == "S304-14" else "13.1.3"),
         TraceEntry("gamma_g", f"{section.gamma_g:.4f}", "-", "1.0 fully grouted; otherwise min(Ae/Ag, 0.5)", shear_clause),
         TraceEntry("Pr,max", f"{cap:.3f}", "kN", "0.80 [sum(0.85 phi_m f'm,i Ai) + eligible compression-steel net force]", f"{flex_clause}.4"),
         TraceEntry("Mr(Pf)", "-" if moment_resistance is None else f"{moment_resistance:.3f}", "kN-m", "elastic/cracked section envelope" if wall.wall_type == "Unreinforced masonry" else "strain-compatible P-M curve; reduced arm for squat walls", f"{flex_clause}.2"),
@@ -2149,6 +2235,7 @@ __all__ = [
     "interaction_curve",
     "masonry_strengths",
     "moment_at_axial_load",
+    "resolved_face_shell_thickness",
     "section_point_at_c",
     "section_properties",
     "ties_qualify",

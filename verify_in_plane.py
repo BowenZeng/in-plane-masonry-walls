@@ -24,6 +24,9 @@ def complete_wall(**changes: object) -> WallInput:
         horizontal_anchorage_confirmed=True,
         horizontal_continuity_confirmed=True,
         unit_geometry_confirmed=True,
+        # Declared unit geometry (190 mm unit; comparison-workbook values): bedded and S304:24 minimum.
+        face_shell_thickness=36.2,
+        minimum_face_shell_thickness=30.0,
         base_connection_confirmed=True,
         top_connection_confirmed=True,
         oop_check_provided=True,

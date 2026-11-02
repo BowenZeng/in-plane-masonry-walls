@@ -152,6 +152,8 @@ class OctoberReviewRegressions(unittest.TestCase):
     def _unreinforced(self, **changes):
         values = dict(edition="S304:24", wall_type="Unreinforced masonry", length=3000.0, height=3000.0, thickness=190.0,
                       nominal_unit_strength=15.0, unreinforced_condition="Hollow ungrouted", face_shell_thickness=36.2,
+                      # WP-unit: S304:24 Ae uses the 3.1 minimum face shell; this regression keeps 36.2 mm for both.
+                      minimum_face_shell_thickness=36.2,
                       factored_axial=100.0, factored_moment=50.0, factored_shear=40.0, unfactored_dead_load_above=80.0,
                       bar_count=0)
         values.update(changes)

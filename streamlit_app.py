@@ -71,15 +71,28 @@ def main() -> None:
             ["Use lower of discrete and smeared", "Discrete", "Smeared"],
             disabled=wall_type != "Partially grouted reinforced masonry",
         )
-        face_defaults = {140.0: 26.0, 190.0: 36.2, 240.0: 38.6, 290.0: 41.4}
+        references = engine.UNIT_FACE_SHELL_REFERENCE
+        uses_face_shell = wall_type == "Partially grouted reinforced masonry" or (
+            wall_type == "Unreinforced masonry" and unreinforced_condition == "Hollow ungrouted")
         face_shell = st.number_input(
-            "Effective face-shell thickness tf (mm)",
+            "Mortar-bedded face-shell thickness tf (mm) - reference value, confirm",
             min_value=1.0,
             max_value=float(thickness / 2.0 - 0.1),
-            value=float(face_defaults[thickness]),
+            value=float(references["mortar_bedded"][thickness]),
             step=0.1,
-            disabled=wall_type == "Fully grouted reinforced masonry",
-            help="Physical unit geometry used for ungrouted effective area; verify against the selected unit.",
+            disabled=not uses_face_shell,
+            help="S304-14 effective area and the clear-cell bound. Prefilled from the comparison workbook "
+                 "(CSA A165.1 not supplied; unverified): confirm against the selected unit.",
+        )
+        minimum_face_shell = st.number_input(
+            "S304:24 minimum face-shell thickness (mm), Clause 3.1",
+            min_value=1.0,
+            max_value=float(thickness / 2.0 - 0.1),
+            value=None,
+            step=0.1,
+            disabled=not uses_face_shell,
+            help="S304:24 effective area. Blank = not declared: S304:24 uses the unverified reference value "
+                 f"({references['minimum'][thickness]:g} mm) and its results stay INCOMPLETE.",
         )
         grouted_cell_width = st.number_input(
             "Grouted-cell width along wall (mm)",
@@ -91,6 +104,7 @@ def main() -> None:
         unit_geometry_confirmed = st.checkbox(
             "Selected unit geometry is confirmed",
             value=False,
+            disabled=not uses_face_shell,
         )
 
         st.header("Vertical reinforcement")
@@ -157,7 +171,9 @@ def main() -> None:
 
         with st.expander("Development, splices, and constructability"):
             in_situ_grout = st.number_input("In-situ grout strength f'gr (MPa)", min_value=1.0, value=20.0, step=1.0)
-            clear_cell = st.number_input("Least clear reinforced-cell dimension (mm)", min_value=1.0, value=100.0, step=5.0)
+            clear_cell = st.number_input("Least clear reinforced-cell dimension (mm) - reference value, confirm", min_value=1.0,
+                                         value=float(min(100.0, thickness - 2.0 * face_shell)), step=5.0,
+                                         help="Prefilled with min(100, t - 2 tf); declare the selected unit's clear cell.")
             epoxy = st.checkbox("Vertical bars are epoxy coated", value=False)
             vertical_development = st.number_input("Available vertical development (mm)", min_value=1.0, value=1200.0, step=50.0)
             horizontal_development = st.number_input("Available horizontal development (mm)", min_value=1.0, value=600.0, step=50.0)
@@ -193,6 +209,7 @@ def main() -> None:
         partial_grout_method=partial_method,
         unit_geometry_confirmed=bool(unit_geometry_confirmed),
         face_shell_thickness=float(face_shell),
+        minimum_face_shell_thickness=None if minimum_face_shell is None else float(minimum_face_shell),
         grouted_cell_width=float(grouted_cell_width),
         bar_size=bar_size,
         bar_count=bar_count if reinforced else 0,

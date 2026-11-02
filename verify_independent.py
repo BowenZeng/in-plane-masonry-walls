@@ -4,6 +4,9 @@ Uses only WallInput/calculate_wall from production; material tables, integration
 equilibrium root solving and resistance equations are independently evaluated.
 The June 2025 errata are deliberately outside this audit's authorized basis.
 
+Face shells (plan WP-unit): S304-14 Ae uses the declared mortar-bedded face
+shell and S304:24 Ae the declared Clause 3.1 minimum face shell.
+
 Pd follows the case rule (plan WP2): Pd_case = 0.9 D_cnt + min(0, N_lat), with
 D_cnt = 150 kN + the wall weight and N_lat the case's lateral axial load; in this
 matrix the tension in Pf is taken as the lateral uplift, N_lat = min(0, Pf). The
@@ -36,6 +39,7 @@ def reference(wall):
     reinforced = wall.wall_type != "Unreinforced masonry"
     partial = wall.wall_type == "Partially grouted reinforced masonry"
     bars = [100 + i * (length - 200) / 4 for i in range(5)] if reinforced else []
+    tf = wall.minimum_face_shell_thickness if wall.edition == "S304:24" else wall.face_shell_thickness
     # Every verification bar is 15M, centred at 100, 1300, ... 4900 mm.
     if partial:
         segments = []
@@ -43,14 +47,14 @@ def reference(wall):
         for bar in bars:
             start, end = bar - 100, bar + 100
             if cursor < start:
-                segments.append((cursor, start, 2 * wall.face_shell_thickness, ug))
+                segments.append((cursor, start, 2 * tf, ug))
             segments.append((start, end, thickness, fg))
             cursor = end
         if cursor < length:
-            segments.append((cursor, length, 2 * wall.face_shell_thickness, ug))
+            segments.append((cursor, length, 2 * tf, ug))
         filled_fraction = 1000 / length
     elif not reinforced and wall.unreinforced_condition == "Hollow ungrouted":
-        segments = [(0, length, 2 * wall.face_shell_thickness, ug)]
+        segments = [(0, length, 2 * tf, ug)]
         filled_fraction = 0.0
     else:
         segments = [(0, length, thickness, fg)]
@@ -161,6 +165,7 @@ def main():
             edition=edition, mortar_type=mortar, nominal_unit_strength=strength,
             wall_type=kind, partial_grout_method=method, unreinforced_condition=condition,
             thickness=thickness, face_shell_thickness={140: 26, 190: 36.2, 240: 38.6, 290: 41.4}[thickness],
+            minimum_face_shell_thickness={140: 25, 190: 30, 240: 35, 290: 35}[thickness],
             height=(3000, 5000, 7500, 5000)[load_index], bar_count=5 if reinforced else 0,
             horizontal_bar_size="15M", horizontal_anchorage_confirmed=True, horizontal_continuity_confirmed=True,
             factored_shear=(0, 100, 100, 250)[load_index], factored_moment=(0, 50, 800, 200)[load_index],
