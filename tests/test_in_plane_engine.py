@@ -191,6 +191,25 @@ class InPlaneEngineTests(unittest.TestCase):
         squat = calculate_wall(replace(self.example, height=4500.0, factored_axial=0.0))
         self.assertLessEqual(squat.moment_resistance, normal.moment_resistance + 1.0e-8)
 
+    def test_undecided_shear_steel_requirement_leaves_its_details_incomplete(self) -> None:
+        # S304-14, 4000 x 3000, Pf 200, Vf 60, Mf 150 kN m, 15M bond beams (Av 200) at 2400 mm.
+        # Without the case Pd the no-steel Vr is unknown: the 10.15.1.4 spacing is
+        # INCOMPLETE, not FAIL. With Pd 179.49 kN, Vm 221.74 kN >= Vf 60 kN: not required.
+        wall = WallInput(edition="S304-14", length=4000.0, height=3000.0, factored_axial=200.0,
+                         factored_shear=60.0, factored_moment=150.0, horizontal_reinforcement_type="Bond beam bars",
+                         horizontal_bar_size="15M", horizontal_reinforcement_area=200.0,
+                         horizontal_reinforcement_spacing=2400.0, bond_beam_anchorage="standard_hook")
+        spacing = lambda result: next(c for c in result.checks
+                                      if c.check_id == "ip.horizontal_shear_reinforcement_spacing")
+        undecided = calculate_wall(wall)
+        self.assertIsNone(undecided.shear.horizontal_steel_required)
+        self.assertEqual((spacing(undecided).level, spacing(undecided).unresolved), ("blocked", "incomplete"))
+        self.assertIn("undecided", spacing(undecided).detail)
+        decided = calculate_wall(replace(wall, dead_load_compression=179.49, pd_basis="test: declared case Pd"))
+        self.assertFalse(decided.shear.horizontal_steel_required)
+        self.assertAlmostEqual(decided.shear.resistance_without_horizontal_steel, 221.74, places=2)
+        self.assertEqual((spacing(decided).level, spacing(decided).kind), ("pass", "info"))
+
     def test_vertical_bar_spacing_over_2400_is_blocked(self) -> None:
         result = calculate_wall(
             replace(

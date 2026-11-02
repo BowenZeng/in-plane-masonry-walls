@@ -432,7 +432,8 @@ class ShearResult:
     horizontal_area_credited: float = 0.0
     horizontal_credit_basis: str = ""
     resistance_without_horizontal_steel: float | None = None
-    horizontal_steel_required: bool = True
+    # None: undecided, the no-steel Vr is unknown (e.g. undeclared case Pd).
+    horizontal_steel_required: bool | None = True
     flexural_reinforcement_distribution_assumed: bool = False
 
 
@@ -2405,11 +2406,20 @@ def _checks(
                             f"Not required for in-plane shear: Vf = {wall.factored_shear:.2f} kN <= Vr without "
                             f"horizontal steel = {bare:.2f} kN; {spacing_clause} applies only where horizontal "
                             "reinforcement is required (register I-17).")
+            undecided = ("" if required is not None else
+                         " Vr without horizontal steel cannot be formed from the declared inputs (e.g. the case Pd "
+                         f"or the grout type is not declared), so whether {spacing_clause} requires this steel is "
+                         "undecided (register I-17).")
 
             def requirement(ok: bool, title: str, detail: str, clause: str, *, check_id: str, kind: str = "numeric",
                             unresolved: Unresolved = "", **numbers: object) -> None:
                 if not_required:
                     add_check("pass", title, f"{not_required} {detail}", clause, check_id=check_id, kind="info")
+                elif undecided and not ok and kind == "numeric" and not unresolved:
+                    # Ground rule 2: a detail that binds only where the steel is
+                    # required is INCOMPLETE, not FAIL, while that is undecided.
+                    add(ok, title, detail + undecided, clause, check_id=check_id, kind=kind,
+                        unresolved="incomplete", **numbers)  # type: ignore[arg-type]
                 else:
                     add(ok, title, detail, clause, check_id=check_id, kind=kind, unresolved=unresolved, **numbers)  # type: ignore[arg-type]
 
@@ -3143,13 +3153,13 @@ def calculate_wall(wall: WallInput) -> WallResult:
             bare = _shear_result(wall, physical_section, pd, credit_horizontal=False).resistance
         except CalculationError:
             # e.g. the S304:24 General route without steel needs the undeclared
-            # grout type: the no-steel Vr is unknown, so the steel counts as required.
+            # grout type: the no-steel Vr is unknown and the requirement undecided.
             bare = None
-        required = (wall.bond_pattern == "Stack pattern" or bare is None
-                    or wall.factored_shear > bare + 1.0e-8)
+        required = (True if wall.bond_pattern == "Stack pattern" else None if bare is None
+                    else wall.factored_shear > bare + 1.0e-8)
     else:
         bare = shear.resistance
-        required = bare is None or wall.factored_shear > bare + 1.0e-8
+        required = None if bare is None else wall.factored_shear > bare + 1.0e-8
     shear = replace(shear, resistance_without_horizontal_steel=bare, horizontal_steel_required=required)
     sliding = _sliding_result(wall, physical_section, pd)
     detailing = _detailing_result(wall, physical_section)
@@ -3249,7 +3259,8 @@ def calculate_wall(wall: WallInput) -> WallResult:
         TraceEntry("Vr", _fmt(shear.resistance), "kN", "min(Vm + Vs, Vr,max)", shear_clause),
         TraceEntry("Vr (no horizontal steel)", _fmt(shear.resistance_without_horizontal_steel), "kN",
                    "Vr with Av = 0: horizontal steel required for in-plane shear when Vf exceeds it "
-                   f"({'required' if shear.horizontal_steel_required else 'not required'}; register I-17)",
+                   f"({ {True: 'required', False: 'not required', None: 'undecided'}[shear.horizontal_steel_required]}; "
+                   "register I-17)",
                    "10.15.1.4" if wall.edition == "S304-14" else "11.15.1.4"),
         TraceEntry("self-weight", f"{self_weight:.3f}", "kN", self_weight_equation, "wall-level dead load"),
         TraceEntry("bond-beam grout", f"{grout_weight:.3f}", "kN",
