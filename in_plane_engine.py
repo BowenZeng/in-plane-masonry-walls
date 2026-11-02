@@ -227,7 +227,10 @@ class WallInput:
     # corrections list that clause but their wording has not been read here;
     # the square-root form is a proposed correction, off by default.
     apply_proposed_8_10_2_3_correction: bool = False
-    grout_type: str = "Coarse"
+    # None = not declared: the S304:24 General method raises; a general route
+    # forced by axial tension uses fine grout (ga 1.7) with an INCOMPLETE item;
+    # the "lower of" candidate uses ga 1.4, bounded by the simplified route (I-15).
+    grout_type: str | None = None
     squat_shear_distribution_confirmed: bool = False
     stack_joint_area: float | None = None
     stack_vertical_shear: float | None = None
@@ -249,7 +252,8 @@ class WallInput:
     unit_solid_fraction: float = 0.56
     sliding_friction: float = 1.0
     sliding_plane: str = "Base/support joint"
-    uncracked_area_fraction: float = 0.5
+    # No bond credit unless the case's uncracked fraction is entered (F-045).
+    uncracked_area_fraction: float = 0.0
     vertical_bars_developed_at_base: bool = True
     developed_vertical_bar_count: int | None = None
     in_situ_grout_strength: float = 20.0
@@ -260,7 +264,7 @@ class WallInput:
     splice_present: bool = False
     splice_class: str = "B"
     class_a_splice_confirmed: bool = False
-    provided_lap_length: float = 1200.0
+    provided_lap_length: float | None = None
     vertical_bars_continuous: bool = True
     available_termination_extension: float = 5000.0
     joint_wire_diameter: float = 3.65
@@ -335,6 +339,8 @@ class ShearResult:
     ze: float | None
     method: str
     stack_vertical_resistance: float | None = None
+    ze_basis: str = ""
+    grout_assumed: bool = False
 
 
 @dataclass(frozen=True)
@@ -501,7 +507,6 @@ def _validate(wall: WallInput) -> None:
         "least clear cell dimension": wall.least_clear_cell_dimension,
         "available vertical development": wall.available_vertical_development,
         "available horizontal development": wall.available_horizontal_development,
-        "provided lap length": wall.provided_lap_length,
         "masonry density": wall.masonry_density,
         "grout density": wall.grout_density,
     }
@@ -548,8 +553,12 @@ def _validate(wall: WallInput) -> None:
         "Use lower of simplified and general",
     ):
         raise CalculationError("Choose a supported S304:24 shear method.")
-    if wall.grout_type not in ("Coarse", "Fine"):
+    if wall.grout_type not in (None, "Coarse", "Fine"):
         raise CalculationError("Choose coarse or fine grout.")
+    if wall.provided_lap_length is not None and (
+        not math.isfinite(wall.provided_lap_length) or wall.provided_lap_length <= 0.0
+    ):
+        raise CalculationError("Provided lap length must be positive and finite.")
     if wall.sliding_plane not in ("Base/support joint", "Between masonry courses"):
         raise CalculationError("Choose a supported sliding plane.")
     if wall.wall_type not in (
@@ -892,8 +901,11 @@ def _detailing_result(
 ) -> DetailingResult:
     vertical_ld = _development_length(wall, section, horizontal=False) or 0.0
     horizontal_ld = _development_length(wall, section, horizontal=True)
+    # Class A length (1.0 ld) only when its eligibility is confirmed; otherwise
+    # the Class B length 1.3 ld.
+    class_a = wall.splice_class == "A" and wall.class_a_splice_confirmed
     lap_required = (
-        max(300.0, vertical_ld * (1.0 if wall.splice_class == "A" else 1.3))
+        max(300.0, vertical_ld * (1.0 if class_a else 1.3))
         if wall.splice_present
         else None
     )
@@ -1168,6 +1180,8 @@ def _shear_result(
     general_resistance: float | None = None
     epsilon_x: float | None = None
     ze: float | None = None
+    ze_basis = ""
+    grout_assumed = False
     if wall.edition == "S304:24" and reinforced:
         minimum_av_2024 = 0.35 * wall.thickness * spacing / horizontal_fy
 
@@ -1220,11 +1234,21 @@ def _shear_result(
                 else 230.0 / (1000.0 + 1.4 * zs)
             )
             theta_simplified = 42.0
-            ze = (
-                300.0
-                if av >= minimum_av_2024
-                else (1.4 if wall.grout_type == "Coarse" else 1.7) * zs
-            )
+            if av >= minimum_av_2024:
+                ze, ze_basis = 300.0, "Av >= Av,min: ze = 300 mm"
+            elif wall.grout_type is not None:
+                ga = 1.4 if wall.grout_type == "Coarse" else 1.7
+                ze, ze_basis = ga * zs, f"ze = ga zs; {wall.grout_type.lower()} grout, ga = {ga}"
+            elif wall.shear_method == "General":
+                raise CalculationError("The S304:24 General shear method needs grout_type (ze = ga zs, ga 1.4 coarse / "
+                                       "1.7 fine, 11.10.2.6.2): declare the grout type.")
+            elif wall.factored_axial < 0.0:
+                grout_assumed = True
+                ze, ze_basis = 1.7 * zs, ("ze = ga zs; grout type not declared, fine-grout ga = 1.7 used on the general "
+                                          "route required by axial tension (register I-15)")
+            else:
+                ze, ze_basis = 1.4 * zs, ("ze = ga zs; grout type not declared, candidate ga = 1.4, bounded by the "
+                                          "simplified route (register I-15)")
             tension_half_area = developed_fraction * BAR_AREAS[wall.bar_size] * sum(
                 position >= section.centroid for position in section.bar_positions
             )
@@ -1354,6 +1378,8 @@ def _shear_result(
         ze=ze,
         method=method,
         stack_vertical_resistance=stack_resistance,
+        ze_basis=ze_basis,
+        grout_assumed=grout_assumed,
     )
 
 
@@ -1644,10 +1670,16 @@ def _checks(
                     check_id="ip.class_a_splice_eligibility",
                     kind="review",
                 )
+            lap_basis = ("Class A length 1.0 ld (eligibility confirmed)" if wall.splice_class == "A" and wall.class_a_splice_confirmed
+                         else "Class A requested, eligibility not confirmed: Class B length 1.3 ld used" if wall.splice_class == "A"
+                         else "Class B length 1.3 ld")
             add(
-                wall.provided_lap_length >= detailing.lap_required - 1.0e-8,
+                wall.provided_lap_length is not None
+                and wall.provided_lap_length >= detailing.lap_required - 1.0e-8,
                 f"Class {wall.splice_class} tension lap splice",
-                f"Provided = {wall.provided_lap_length:.0f} mm; required = {detailing.lap_required:.0f} mm.",
+                (f"Provided = {wall.provided_lap_length:.0f} mm; required = {detailing.lap_required:.0f} mm ({lap_basis})."
+                 if wall.provided_lap_length is not None else
+                 f"Lap length not entered; required = {detailing.lap_required:.0f} mm ({lap_basis})."),
                 "12.5.4.2" if wall.edition == "S304-14" else "13.5.4.2",
                 check_id="ip.class_tension_lap_splice",
                 kind="numeric",
@@ -1656,6 +1688,7 @@ def _checks(
                 units="mm",
                 comparison=">=",
                 tolerance=1e-8,
+                unresolved="incomplete" if wall.provided_lap_length is None else "",
             )
         add(
             wall.vertical_bars_continuous
@@ -1779,7 +1812,7 @@ def _checks(
                 add(
                     wall.available_horizontal_development >= detailing.horizontal_development_required - 1.0e-8,
                     "Bond-beam-bar development",
-                    f"Available = {wall.available_horizontal_development:.0f} mm; required = {detailing.horizontal_development_required:.0f} mm.",
+                    f"Available = {wall.available_horizontal_development:.0f} mm; required = {detailing.horizontal_development_required:.0f} mm; {_k1_text(wall)}.",
                     "12.4.2.3" if wall.edition == "S304-14" else "13.4.2.3",
                     check_id="ip.bond_beam_bar_development",
                     kind="numeric",
@@ -1808,6 +1841,18 @@ def _checks(
                 check_id="ip.required_horizontal_shear_reinforcement",
                 kind="numeric",
             )
+
+    if shear.grout_assumed:
+        add(
+            False,
+            "Grout type declared",
+            "The S304:24 general shear route is required by axial tension and the grout type is not declared: "
+            "fine grout (ga = 1.7) was used. Declare the grout type (register I-15).",
+            "11.10.2.6.2",
+            check_id="ip.grout_type_declared",
+            kind="numeric",
+            unresolved="incomplete",
+        )
 
     if wall.wall_type == "Unreinforced masonry" and wall.horizontal_reinforcement_type != "None":
         unreinforced_horizontal_ratio = wall.horizontal_reinforcement_area / (
@@ -1869,7 +1914,7 @@ def _checks(
             add(
                 wall.available_horizontal_development >= detailing.horizontal_development_required - 1.0e-8,
                 "Bond-beam-bar development",
-                f"Available = {wall.available_horizontal_development:.0f} mm; required = {detailing.horizontal_development_required:.0f} mm.",
+                f"Available = {wall.available_horizontal_development:.0f} mm; required = {detailing.horizontal_development_required:.0f} mm; {_k1_text(wall)}.",
                 "12.4.2.3" if wall.edition == "S304-14" else "13.4.2.3",
                 check_id="ip.bond_beam_bar_development",
                 kind="numeric",
@@ -2048,6 +2093,13 @@ def _checks(
     return tuple(checks)
 
 
+def _k1_text(wall: WallInput) -> str:
+    """Bar-location factor k1 of the bond-beam bars and its declared basis (register I-16)."""
+    if wall.horizontal_top_bar:
+        return "k1 = 1.3 (declared: more than 300 mm of fresh grout below the bars)"
+    return "k1 = 1.0 (declared: 300 mm or less of fresh grout below the bars)"
+
+
 def _fmt(value: float | None, digits: int = 3) -> str:
     return "-" if value is None else f"{value:.{digits}f}"
 
@@ -2179,10 +2231,14 @@ def calculate_wall(wall: WallInput) -> WallResult:
         TraceEntry("beta", "-" if shear.beta is None else f"{shear.beta:.6f}", "-", shear.method, shear_clause),
         TraceEntry("theta", "-" if shear.theta_degrees is None else f"{shear.theta_degrees:.3f}", "deg", shear.method, shear_clause),
         TraceEntry("epsilon_x", "-" if shear.epsilon_x is None else f"{shear.epsilon_x:.7f}", "-", "S304:24 general shear method", shear_clause),
-        TraceEntry("ze", "-" if shear.ze is None else f"{shear.ze:.3f}", "mm", "S304:24 general shear method", shear_clause),
+        TraceEntry("ze", "-" if shear.ze is None else f"{shear.ze:.3f}", "mm",
+                   "S304:24 general shear method" + (f"; {shear.ze_basis}" if shear.ze_basis else ""), shear_clause),
         TraceEntry("Vr,slide", _fmt(sliding.resistance), "kN", sliding.method, shear_clause + ".5"),
         TraceEntry("Vr,vertical joint", "-" if shear.stack_vertical_resistance is None else f"{shear.stack_vertical_resistance:.3f}", "kN", "stack-pattern vertical joint resistance; checked separately from horizontal Vf", shear_clause + ".4"),
         TraceEntry("vertical ld", f"{detailing.vertical_development_required:.3f}", "mm", "CSA straight deformed-bar development", "12.4.2.3" if wall.edition == "S304-14" else "13.4.2.3"),
+        TraceEntry("horizontal ld", _fmt(detailing.horizontal_development_required), "mm",
+                   f"CSA straight deformed-bar development of the bond-beam bars; {_k1_text(wall)}",
+                   "12.4.2.3; 12.4.2.5(a)" if wall.edition == "S304-14" else "13.4.2.3; 13.4.2.5(a)"),
     )
     return WallResult(
         wall=wall,

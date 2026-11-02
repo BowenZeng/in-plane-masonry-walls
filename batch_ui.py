@@ -31,7 +31,6 @@ def _initialize() -> None:
                          "Enabled": c.enabled, **c.factors} for c in lc.REFERENCE_COMBINATIONS],
         "generated_weight": lc.ADD_SELF_WEIGHT,
         "direct_supplements": {}, "generated_supplements": {}, "copied_origins": {},
-        "original_case_migrated": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -110,7 +109,6 @@ def _copy_generated(cases: tuple[lc.LoadCase, ...]) -> None:
     st.session_state.copied_origins = {case.case_id: asdict(case) for case in cases}
     st.session_state.direct_supplements = dict(st.session_state.generated_supplements)
     st.session_state.direct_version += 1
-    st.session_state.original_case_migrated = True
     st.session_state.load_mode = DIRECT
 
 
@@ -273,13 +271,8 @@ def render_batch(wall: engine.WallInput) -> None:
                   "loads are retained, so the copied cases keep their Pd.")
         st.button("Copy generated cases to direct mode", on_click=_copy_generated, args=(cases,),
                   disabled=not cases or any(c.error for c in cases))
+    # No case starts with an uncracked-area credit; it is entered per case (F-045).
     storage_key = "direct_supplements" if mode == DIRECT else "generated_supplements"
-    if mode == DIRECT and not st.session_state.original_case_migrated:
-        original = next((c for c in cases if c.case_id == "CASE-1"), None)
-        if original is not None:
-            st.session_state[storage_key][original.case_id] = lc.review_supplement(
-                wall, original, lc.CaseSupplement(uncracked_area_fraction=0.5))
-        st.session_state.original_case_migrated = True
     counts = Counter(c.case_id for c in cases if c.enabled)
     selectable = {c.case_id: c for c in cases if c.enabled and c.case_id and counts[c.case_id] == 1}
     selected_id = None

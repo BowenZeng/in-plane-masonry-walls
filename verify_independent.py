@@ -168,6 +168,7 @@ def main():
             minimum_face_shell_thickness={140: 25, 190: 30, 240: 35, 290: 35}[thickness],
             height=(3000, 5000, 7500, 5000)[load_index], bar_count=5 if reinforced else 0,
             horizontal_bar_size="15M", horizontal_anchorage_confirmed=True, horizontal_continuity_confirmed=True,
+            grout_type="Coarse",  # the reference takes ga = 1.4 (coarse grout)
             factored_shear=(0, 100, 100, 250)[load_index], factored_moment=(0, 50, 800, 200)[load_index],
             shear_method=("Simplified", "General", "Use lower of simplified and general", "General")[load_index],
         )

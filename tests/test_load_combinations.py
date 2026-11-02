@@ -94,7 +94,8 @@ class BatchTests(unittest.TestCase):
 
     def test_default_single_case_matches_existing_engine_in_both_editions(self):
         case = replace(self.case, actions=lc.Action(200, 1000, 200))
-        supplement = lc.review_supplement(self.wall, case, lc.CaseSupplement(uncracked_area_fraction=.5))
+        # WP-defaults (F-045): no uncracked-area credit unless entered; the engine default is 0.0 too.
+        supplement = lc.review_supplement(self.wall, case, lc.CaseSupplement(uncracked_area_fraction=0.0))
         batch = lc.check_load_cases(self.wall, [case], {case.case_id: supplement})
         weight = engine.wall_self_weight(self.wall)
         for member in batch.results:

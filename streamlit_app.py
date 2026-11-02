@@ -141,9 +141,18 @@ def main() -> None:
         joint_wire_diameter = st.number_input("Joint-wire diameter (mm)", min_value=3.0, value=3.65, step=0.05, disabled=horizontal_type != "Joint reinforcement")
         horizontal_anchored = st.checkbox("Horizontal reinforcement anchored at both wall ends", value=False, disabled=horizontal_type == "None")
         horizontal_continuous = st.checkbox("Horizontal reinforcement continuous along wall and at top", value=False, disabled=horizontal_type == "None", help="For design joint reinforcement, confirm full anchorage, Class B splices and corner/intersection detailing.")
-        horizontal_top_bar = st.checkbox("More than 300 mm fresh grout below horizontal bar", value=False, disabled=horizontal_type != "Bond beam bars")
+        top_bar_choice = st.selectbox(
+            "Fresh grout below the bond-beam bars (bar-location factor k1)",
+            ["Not declared (k1 = 1.3 used)", "More than 300 mm: k1 = 1.3", "300 mm or less: k1 = 1.0"],
+            disabled=horizontal_type != "Bond beam bars",
+            help="12.4.2.5(a) / 13.4.2.5(a). Declare the condition; until then the larger k1 = 1.3 is used.")
+        horizontal_top_bar = not top_bar_choice.startswith("300 mm or less")
         shear_method = st.selectbox("S304:24 shear method", ["Use lower of simplified and general", "Simplified", "General"])
-        grout_type = st.selectbox("Grout type for general shear", ["Coarse", "Fine"])
+        grout_choice = st.selectbox("Grout type for general shear", ["Not declared", "Coarse", "Fine"],
+                                    help="ze = ga zs with ga 1.4 (coarse) or 1.7 (fine). Not declared: the General method "
+                                         "is refused, a general route forced by axial tension uses fine grout and is "
+                                         "INCOMPLETE, and the 'lower of' candidate uses 1.4 bounded by the simplified route.")
+        grout_type = None if grout_choice == "Not declared" else grout_choice
         squat_distribution = st.checkbox("Squat-wall shear is distributed along the full length", value=False, disabled=height >= length, help="Required to use the increased 2014 shear cap, or the increased unreinforced 2024 shear cap.")
         stack_supplied = False
         stack_area = 0.0
@@ -180,7 +189,8 @@ def main() -> None:
             splice_present = st.checkbox("Vertical tension lap splice present", value=False)
             splice_class = st.selectbox("Splice class", ["B", "A"], disabled=not splice_present)
             class_a_confirmed = st.checkbox("Class A: As provided/required >= 2 and at most 50% spliced", value=False, disabled=not splice_present or splice_class != "A")
-            lap_length = st.number_input("Provided lap length (mm)", min_value=1.0, value=1200.0, step=50.0, disabled=not splice_present)
+            lap_length = st.number_input("Provided lap length (mm)", min_value=1.0, value=None, step=50.0, disabled=not splice_present,
+                                         help="Blank = not entered: the lap-splice check is INCOMPLETE.")
             bars_continuous = st.checkbox("Vertical bars continuous over wall height", value=True)
             termination_extension = st.number_input("Available extension past flexural cutoff (mm)", min_value=0.0, value=5000.0, step=100.0, disabled=bars_continuous)
             mortar_joint = st.number_input("Mortar-joint thickness (mm)", min_value=1.0, value=10.0, step=1.0)
@@ -255,7 +265,7 @@ def main() -> None:
         splice_present=bool(splice_present and reinforced),
         splice_class=splice_class,
         class_a_splice_confirmed=bool(class_a_confirmed),
-        provided_lap_length=float(lap_length),
+        provided_lap_length=None if lap_length is None else float(lap_length),
         vertical_bars_continuous=bool(bars_continuous),
         available_termination_extension=float(termination_extension),
         joint_wire_diameter=float(joint_wire_diameter),

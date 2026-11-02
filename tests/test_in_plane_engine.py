@@ -324,6 +324,7 @@ class InPlaneEngineTests(unittest.TestCase):
         self.assertAlmostEqual(result.shear.beta, 0.02471776589423648, places=12)
 
     def test_between_course_sliding_reports_bond_route_and_dowel_area(self) -> None:
+        # Hollow URM default wall: Pd = 0.9 (150 + 54.80) = 184.32 kN; no uncracked-area credit by default (F-045).
         result = calculate_wall(
             replace(
                 self.example,
@@ -331,10 +332,13 @@ class InPlaneEngineTests(unittest.TestCase):
                 bar_count=0,
                 sliding_plane="Between masonry courses",
                 factored_shear=400.0,
+                dead_load_compression=0.9 * (150.0 + 54.80),
             )
         )
         self.assertIsNotNone(result.sliding.bond_route)
         self.assertGreater(result.sliding.required_dowel_area, 0.0)
+        self.assertEqual(result.wall.uncracked_area_fraction, 0.0)
+        self.assertAlmostEqual(result.sliding.resistance, 110.59, delta=0.005)
 
     def test_development_lap_and_clearance_checks_block_bad_detail(self) -> None:
         result = calculate_wall(

@@ -15,7 +15,8 @@ class AuditRegressions(unittest.TestCase):
 
     def test_contiguous_grouted_cells_use_fully_grouted_shear_rules(self):
         for edition in ("S304-14", "S304:24"):
-            full = WallInput(edition=edition, bar_count=25, shear_method="General")
+            # WP-defaults: the General method needs a declared grout type (F-034).
+            full = WallInput(edition=edition, bar_count=25, shear_method="General", grout_type="Coarse")
             packed = replace(full, wall_type="Partially grouted reinforced masonry", grouted_cell_width=200.0)
             a, b = calculate_wall(full), calculate_wall(packed)
             self.assertEqual(b.section.gamma_g, 1.0)
@@ -73,7 +74,7 @@ class AuditRegressions(unittest.TestCase):
         self.assertAlmostEqual(result.shear.beta, 230 / (1000 + 1.4 * spacing))
 
     def test_general_shear_reduces_underdeveloped_longitudinal_area(self):
-        base = WallInput(edition="S304:24", shear_method="General")
+        base = WallInput(edition="S304:24", shear_method="General", grout_type="Coarse")
         full = calculate_wall(base)
         short = calculate_wall(replace(base, available_vertical_development=300.0))
         fraction = 300 / full.detailing.vertical_development_required
@@ -117,11 +118,16 @@ class AuditRegressions(unittest.TestCase):
         self.assertEqual(result.pm_utilization, 0.0)
 
     def test_class_a_requires_area_and_staggering_conditions(self):
-        wall = WallInput(splice_present=True, splice_class="A")
+        wall = WallInput(splice_present=True, splice_class="A", provided_lap_length=450.0)
         result = calculate_wall(wall)
         self.assertEqual(next(c.level for c in result.checks if c.title == "Class A splice eligibility"), "blocked")
+        # WP-defaults: unconfirmed Class A takes the Class B length 1.3 ld = 534.87 mm (ld 411.44 mm).
+        self.assertAlmostEqual(result.detailing.lap_required, 534.87, delta=0.005)
+        self.assertEqual(next(c.level for c in result.checks if c.check_id == "ip.class_tension_lap_splice"), "blocked")
         confirmed = calculate_wall(replace(wall, class_a_splice_confirmed=True))
         self.assertEqual(next(c.level for c in confirmed.checks if c.title == "Class A splice eligibility"), "pass")
+        self.assertAlmostEqual(confirmed.detailing.lap_required, 411.44, delta=0.005)
+        self.assertEqual(next(c.level for c in confirmed.checks if c.check_id == "ip.class_tension_lap_splice"), "pass")
 
     def test_self_weight_is_for_height_above_checked_joint(self):
         base = calculate_wall(WallInput())
