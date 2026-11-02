@@ -311,7 +311,7 @@ def generate_load_cases(
 def case_fingerprint(wall: engine.WallInput, case: LoadCase) -> str:
     """Reordering/selection is immaterial; changed wall or source actions is not."""
     geometry = asdict(wall)
-    for key in ("edition", "factored_axial", "factored_moment", "factored_shear",
+    for key in ("edition", "factored_axial", "factored_moment", "factored_shear", "earthquake_case",
                 "dead_load_compression", "pd_basis", "uncracked_area_fraction", "stack_vertical_shear",
                 "oop_check_provided", "oop_utilization", "oop_stability_passed"):
         geometry.pop(key)
@@ -463,7 +463,7 @@ def check_load_cases(
                 adjusted = replace(
                     wall, edition=edition, factored_axial=case.actions.p,
                     factored_moment=abs(case.actions.m), factored_shear=abs(case.actions.v),
-                    dead_load_compression=pd, pd_basis=pd_basis,
+                    dead_load_compression=pd, pd_basis=pd_basis, earthquake_case=case.earthquake_case,
                     uncracked_area_fraction=0.0 if stale else supplement.uncracked_area_fraction,
                     stack_vertical_shear=None if stack is None else abs(stack),
                     oop_check_provided=linked is not None,
