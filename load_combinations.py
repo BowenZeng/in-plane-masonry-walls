@@ -375,6 +375,8 @@ def check_load_cases(
                 status = ("FAIL" if any(c.status == "FAIL" for c in checks) else
                           "INCOMPLETE" if any(c.status == "INCOMPLETE" for c in checks) else "PASS")
                 issues = ("Supplemental inputs are stale; linked OOP results were not used.",) if stale else ()
+                # Info items are ignored when they pass; every other unpassed
+                # item (failed, review, incomplete or unsupported) is outstanding.
                 additional = "OUTSTANDING" if issues or any(
                     c.level != "pass" and c.category != "resistance" for c in result.checks
                 ) else "CHECKS CLEAR (limited scope)"

@@ -226,7 +226,7 @@ def _selected_details(batch: lc.BatchResult, selected_id: str | None) -> None:
             result = member.result
             st.dataframe(pd.DataFrame([asdict(c) for c in member.resistance_checks]), hide_index=True,
                          width="stretch", key=f"selected_resistance_{member.edition}")
-            st.dataframe(pd.DataFrame([{"Status": c.level.upper(), "Category": c.category,
+            st.dataframe(pd.DataFrame([{"Status": reports.check_status(c), "Category": c.category,
                                         "Check": c.title, "Result": c.detail, "Clause": c.clause}
                                        for c in result.checks]), hide_index=True, width="stretch",
                          key=f"selected_checks_{member.edition}")

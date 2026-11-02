@@ -26,6 +26,24 @@ def _json(value: object) -> str:
     return json.dumps(clean(value), sort_keys=True, default=str, allow_nan=False)
 
 
+def check_status(check) -> str:
+    """Batch/UI status of one engine check; the single mapping for exports and the UI.
+
+    A blocked numeric check is UNSUPPORTED (capability missing) or INCOMPLETE
+    (declaration missing) when the engine says so, otherwise BLOCKED (not met).
+    Review items are BLOCKED until confirmed; info items never pass or fail.
+    """
+    if check.kind == "info":
+        return "INFO"
+    if check.level == "pass":
+        return "PASS"
+    if check.kind != "review" and check.unresolved == "incomplete":
+        return "INCOMPLETE"
+    if check.kind != "review" and check.unresolved == "unsupported":
+        return "UNSUPPORTED"
+    return "BLOCKED"
+
+
 def context(member: CaseResult) -> dict[str, object]:
     case = member.case
     return {
@@ -85,7 +103,7 @@ def check_rows(batch: BatchResult) -> list[dict[str, object]]:
                          "Utilization": check.utilization})
         if member.result is not None:
             rows.extend({**header, "Category": check.category, "Check": check.title,
-                         "Status": check.level.upper(), "Result": check.detail, "Clause": check.clause}
+                         "Status": check_status(check), "Result": check.detail, "Clause": check.clause}
                         for check in member.result.checks)
         rows.extend({**header, "Category": "Input / review", "Check": "Case evaluation",
                      "Status": member.resistance_status, "Result": issue} for issue in member.issues)

@@ -26,12 +26,115 @@ WallType = Literal[
     "Partially grouted reinforced masonry",
 ]
 CheckLevel = Literal["pass", "warning", "blocked"]
+# Why a blocked numeric check is unresolved: "" = the requirement is not met
+# (a failure); "incomplete" = a declaration the check needs is missing (no
+# review evidence can resolve it); "unsupported" = the engine does not
+# implement the requirement for the declared conditions (a coverage gap).
+Unresolved = Literal["", "unsupported", "incomplete"]
 
 PHI_M = 0.60
 PHI_S = 0.85
 E_S = 200_000.0
 EPS_MU = 0.003
 ECCENTRICITY_LIMIT = 0.33
+
+# Pd is based on 0.9 times the dead load (S304-14 2.3 and 10.10.2.1; S304:24
+# Clause 3). NBC 2025 4.1.3.2.(5) takes 1.0D in load case 5 for member
+# resistances; this engine keeps 0.9 in every combination (register I-1,
+# F-062). Flipping the constant changes only load-case-5 values.
+PD_DEAD_LOAD_FACTOR = 0.9
+# A bar exactly at mid-length belongs to the tension half in the S304:24
+# eps_x area ("within 0.5 lw"), with a tolerance of 1e-6 lw (register I-6).
+TENSION_HALF_BOUNDARY_BAR = "include"
+# Reference face-shell thicknesses (mm) by nominal unit thickness. Source: the
+# comparison workbook via masonry_oop.masonry_tables; CSA A165.1 was not
+# supplied, so the values are unverified (register I-14). A result that uses
+# one of them carries an INCOMPLETE ip.unit_face_shell_declared item.
+UNIT_FACE_SHELL_REFERENCE = {
+    "mortar_bedded": {140.0: 26.0, 190.0: 36.2, 240.0: 38.6, 290.0: 41.4},
+    "minimum": {140.0: 25.0, 190.0: 30.0, 240.0: 35.0, 290.0: 35.0},
+}
+WALL_ROLES = ("loadbearing_shear_wall", "non_loadbearing_shear_wall", "infill_shear_wall")
+
+
+def _register(question: str, reading: str, cls: str, blocking: str, findings: str) -> dict[str, str]:
+    return {"question": question, "reading": reading, "class": cls, "blocking": blocking, "findings": findings}
+
+
+# Interpretation register entries owned by the in-plane engine. Classes: C
+# confirmed defect, P provisional interpretation, S conservative policy, M
+# model choice, G capability gap; "policy" and "declaration" mark tool rules.
+# The ids are shared with the masonry_check provenance and the check details.
+INTERPRETATIONS = {
+    "I-1": _register("Dead-load factor in Pd for NBC load case 5: 0.9 (S304 Pd definition) or 1.0 (NBC 4.1.3.2.(5))?",
+                     "0.9 in every combination; constant PD_DEAD_LOAD_FACTOR", "P",
+                     "none; printed in every Pd trace", "F-062, F-002, F-003"),
+    "I-2": _register("Pd without a declared case composition",
+                     "not computed; the Pd-dependent checks are INCOMPLETE", "policy",
+                     "diagonal shear (Pd routes) and sliding INCOMPLETE until D_cnt and the signed lateral axial load, or a sourced signed Pd, are declared",
+                     "F-005, F-003, R05"),
+    "I-3": _register("Sliding clamp basis",
+                     "C = max(0, Pd_case + phi_s As,dev fy kdev), never Pf; bed-joint friction max(0, Pd_case); S304-14 7.10.5.1 P1 read as Pd",
+                     "C + P", "none", "F-003, F-192"),
+    "I-4": _register("S304:24 shear-friction resistances without phi_m as printed (April 2024)",
+                     "printed form (11.10.5.1 p.91; 8.10.5 p.58)", "P",
+                     "none; the detail names the printed basis", "F-056"),
+    "I-5": _register("S304:24 8.10.2.3 vm without sqrt(f'm) as printed",
+                     "printed form unless apply_proposed_8_10_2_3_correction", "P",
+                     "URM only (outside Release 1 scope)", "F-059"),
+    "I-6": _register("Bar exactly at mid-length in the eps_x area",
+                     "include, tolerance 1e-6 lw (TENSION_HALF_BOUNDARY_BAR)", "P",
+                     "none; one convention for every geometry", "F-057, R07"),
+    "I-7": _register("eps_x doubling under net tension",
+                     "only when Mf <= |Pf| e_t (compression face cracked)", "P", "none", "F-065"),
+    "I-8": _register("S304-14 dv for walls without distributed flexural reinforcement",
+                     "declared flexural_reinforcement_distributed; false -> min(0.8 lw, d)", "P",
+                     "the declaration is required for S304-14 walls with fewer than 3 bars", "F-101"),
+    "I-9": _register("Partially grouted flexure model",
+                     "discrete segments (Table 4 Note 3 second option); the smeared value is reported beside it",
+                     "P", "none", "F-071"),
+    "I-10": _register("Squat-wall deep-section model (10.2.8 / 11.2.8)",
+                      "plane-section bar forces with the resultant at d (force-weighted tension centroid in S304:24)",
+                      "P", "P-M UNSUPPORTED when the reduced-arm moment is negative or a >= d",
+                      "F-055, F-058, F-068"),
+    "I-12": _register("dcs reading",
+                      "S304:24 outside masonry surface; S304-14 'closest masonry surface' = grouted-cell wall; table route offered",
+                      "P", "none", "F-038, F-053, F-141"),
+    "I-13": _register("Bars developed over less than ld",
+                      "proportional kdev in Mr, Tr and the S304:24 dowel force; S304-14 dowels all-or-nothing",
+                      "P", "none", "F-047"),
+    "I-14": _register("Face-shell thickness per edition (CSA A165.1 not supplied)",
+                      "declared values; reference table UNIT_FACE_SHELL_REFERENCE unverified", "declaration",
+                      "ip.unit_face_shell_declared INCOMPLETE whenever a reference value was used",
+                      "F-030, F-061, F-052"),
+    "I-15": _register("Undeclared grout type under 'lower of'",
+                      "candidate ga 1.4 bounded by the simplified route; forced general route INCOMPLETE", "policy",
+                      "as stated; the General method raises", "F-034"),
+    "I-16": _register("k1 for bond-beam bars", "declared horizontal_top_bar", "declaration",
+                      "required when bond beams are entered", "F-037"),
+    "I-17": _register("Horizontal steel beyond the spacing limit; spacing items where no shear steel is needed",
+                      "not credited; items not applicable when Vf <= Vr(Av = 0)", "C + P", "none", "F-046, F-066"),
+    "I-18": _register("Minimum vertical steel for s <= 4t",
+                      "total As >= 0.00125 t lw (C); end-bar tributary rule (P)", "C + P",
+                      "none; both named in the detail", "F-075"),
+    "I-19": _register("Column definition h > 5(t+10) and lw < 3(t+10)",
+                      "partially grouted or hollow elements blocked", "C",
+                      "ip.column_dimension_limits FAIL", "F-089, R08"),
+    "I-20": _register("Minimum-steel continuity with terminated bars", "not modelled", "G",
+                      "ip.minimum_vertical_reinforcement_continuity UNSUPPORTED when bars are not continuous",
+                      "F-033, R04"),
+    "I-21": _register("A371 clearance limits (not supplied)", "none", "declaration",
+                      "review item only; no numeric check", "F-099"),
+    "I-22": _register("Seismic provisions (Clause 16 / 17) and NBC 4.1.8 applicability",
+                      "not implemented; 4.1.8.1 simplified-procedure exemption with verified eligibility", "G",
+                      "seismic gate UNSUPPORTED (INCOMPLETE while undeclared) for every wall",
+                      "F-007, F-048, F-049, F-014"),
+    "I-30": _register("Infill shear walls", "not evaluated", "G",
+                      "ip.infill_shear_wall_role UNSUPPORTED", "F-012"),
+    "I-31": _register("Unreinforced shear walls", "legacy route only, outside Release 1 scope", "G",
+                      "masonry_check has no URM route; UI/batch URM runs carry the seismic gate and the face-shell declaration item",
+                      "F-031, F-052, F-090, F-098"),
+}
 
 BAR_PROPERTIES = {
     "10M": (100.0, 11.3),
@@ -192,6 +295,9 @@ class InteractionPoint:
     m: float
     c: float | None
     branch: str
+    # False where the section model is outside its domain at this neutral
+    # axis (e.g. the squat-wall deep-section arm, register I-10).
+    valid: bool = True
 
 
 @dataclass(frozen=True)
@@ -258,6 +364,7 @@ class Check:
     units: str = ""
     comparison: str | None = None
     tolerance: float = 0.0
+    unresolved: Unresolved = ""
 
 
 @dataclass(frozen=True)
@@ -292,6 +399,8 @@ class WallResult:
     trace: tuple[TraceEntry, ...]
     curve_method: str = "Discrete"
     alternate_curve_method: str | None = None
+    pd_basis: str = ""
+    moment_resistance_reason: str = "ok"
 
 
 class CalculationError(ValueError):
@@ -1236,12 +1345,20 @@ def _checks(
 ) -> tuple[Check, ...]:
     checks: list[Check] = []
 
+    def add_check(level: CheckLevel, title: str, detail: str, clause: str, category: str = "additional",
+                  *, check_id: str = "", kind: str = "numeric", demand: float | None = None,
+                  limit: float | None = None, units: str = "", comparison: str | None = None,
+                  tolerance: float = 0.0, unresolved: Unresolved = "") -> None:
+        checks.append(Check(level, title, detail, clause, category, check_id, kind, demand,
+                            limit, units, comparison, tolerance, unresolved))
+
     def add(ok: bool, title: str, detail: str, clause: str, category: str = "additional",
             *, check_id: str = "", kind: str = "numeric", demand: float | None = None,
             limit: float | None = None, units: str = "", comparison: str | None = None,
-            tolerance: float = 0.0) -> None:
-        checks.append(Check("pass" if ok else "blocked", title, detail, clause, category,
-                            check_id, kind, demand, limit, units, comparison, tolerance))
+            tolerance: float = 0.0, unresolved: Unresolved = "") -> None:
+        add_check("pass" if ok else "blocked", title, detail, clause, category,
+                  check_id=check_id, kind=kind, demand=demand, limit=limit, units=units,
+                  comparison=comparison, tolerance=tolerance, unresolved="" if ok else unresolved)
 
     flex_prefix = ("7" if wall.edition == "S304-14" else "8") if wall.wall_type == "Unreinforced masonry" else ("10" if wall.edition == "S304-14" else "11")
     flex_clause = f"{flex_prefix}.2 / {flex_prefix}.4"
@@ -1952,6 +2069,11 @@ def calculate_wall(wall: WallInput) -> WallResult:
 __all__ = [
     "BAR_AREAS",
     "BAR_PROPERTIES",
+    "INTERPRETATIONS",
+    "PD_DEAD_LOAD_FACTOR",
+    "TENSION_HALF_BOUNDARY_BAR",
+    "UNIT_FACE_SHELL_REFERENCE",
+    "WALL_ROLES",
     "CalculationError",
     "Check",
     "DetailingResult",
