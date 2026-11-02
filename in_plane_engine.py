@@ -294,6 +294,9 @@ class WallInput:
     unfactored_dead_load_above: float = 150.0
     include_wall_self_weight_in_pd: bool = True
     height_above_section: float | None = None
+    # Unsupported height between lateral supports (mm) for the column test
+    # (S304-14 2.2; S304:24 3.1); None = the wall height (single storey).
+    unsupported_height: float | None = None
     masonry_density: float = 2100.0
     grout_density: float = 2350.0
     unit_solid_fraction: float = 0.56
@@ -2622,11 +2625,12 @@ def _checks(
     # Partially grouted and hollow elements are not permitted as columns; a
     # fully grouted element is checked as a grouted-solid wall element (I-19).
     column_t = wall.thickness + 10.0
-    tall = wall.height > 5.0 * column_t + 1.0e-9
+    column_height = wall.height if wall.unsupported_height is None else wall.unsupported_height
+    tall = column_height > 5.0 * column_t + 1.0e-9
     column_sized = tall and wall.length < 3.0 * column_t - 1.0e-9
     restricted = wall.wall_type == "Partially grouted reinforced masonry" or (
         wall.wall_type == "Unreinforced masonry" and wall.unreinforced_condition == "Hollow ungrouted")
-    geometry_text = (f"h = {wall.height:.0f} mm vs 5(t + 10) = {5.0 * column_t:.0f} mm; "
+    geometry_text = (f"unsupported height h = {column_height:.0f} mm vs 5(t + 10) = {5.0 * column_t:.0f} mm; "
                      f"lw = {wall.length:.0f} mm vs 3(t + 10) = {3.0 * column_t:.0f} mm")
     if not column_sized:
         column_text = f"{geometry_text}: not column-sized."
@@ -2648,7 +2652,7 @@ def _checks(
         kind="numeric",
         **(dict(demand=wall.length, limit=3.0 * column_t, units="mm", comparison=">=", tolerance=1e-9)
            if restricted and tall else
-           dict(demand=wall.height, limit=5.0 * column_t, units="mm", comparison="<=", tolerance=1e-9)
+           dict(demand=column_height, limit=5.0 * column_t, units="mm", comparison="<=", tolerance=1e-9)
            if restricted else {}),
     )
 
