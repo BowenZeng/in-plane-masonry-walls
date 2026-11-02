@@ -11,6 +11,14 @@ Pd follows the case rule (plan WP2): Pd_case = 0.9 D_cnt + min(0, N_lat), with
 D_cnt = 150 kN + the wall weight and N_lat the case's lateral axial load; in this
 matrix the tension in Pf is taken as the lateral uplift, N_lat = min(0, Pf). The
 reference forms that Pd itself and the engine receives it as the case Pd.
+
+WP-readings: no eccentricity cap on the reinforced section (F-063); the squat
+reduced-arm model is undefined where its moment is negative or a = beta1 c >= d
+(F-058, register I-10), and both sides then report no Mr; eps_x is doubled
+under axial tension only when Mf <= |Pf| e_t, e_t = sum x (x - lw/2) / sum x
+(F-065, register I-7); the bond-beam courses (25 declared 200 mm courses per
+5000 mm of height) add (1 - s_f)(1 - glf) grout to the partially grouted
+self-weight (F-042); the 15M bond-beam bars are hook-anchored (F-080).
 """
 
 from dataclasses import replace
@@ -68,6 +76,7 @@ def reference(wall):
 
     def forces(depth):
         p, m = 0.0, 0.0
+        valid = True
         tensile_forces = []
         for a, b, t, f in segments:
             edge = min(b, (0.8 - 0.01 * max(0, f - 20)) * depth)
@@ -87,10 +96,13 @@ def reference(wall):
                 # Force-weighted tension resultant (F-068).
                 reduced_depth = min(reduced_depth, sum(x * t for x, t in tensile_forces) / sum(t for _, t in tensile_forces))
             reduction = sum(tension * (x - reduced_depth) for x, tension in tensile_forces)
+            # Deep-section model outside its range (F-058): negative reduced-arm
+            # moment, or the stress block reaching the tension resultant.
+            block = max(0.8 - 0.01 * max(0, f - 20) for _, _, _, f in segments) * depth
+            if m - reduction < 0 or block >= reduced_depth:
+                valid = False
             m -= max(0, reduction)
-        if not tensile_forces:
-            m = min(m, max(p, 0) * 0.33 * length)
-        return p / 1000, max(0, m) / 1e6
+        return p / 1000, max(0, m) / 1e6, valid
 
     if reinforced:
         low, high = 1e-8, 2 * length
@@ -100,7 +112,9 @@ def reference(wall):
                 low = c
             else:
                 high = c
-        mr = forces((low + high) / 2)[1]
+        _, mr, valid = forces((low + high) / 2)
+        if not valid:
+            mr = None
     else:
         ft = (0.65 if wall.mortar_type == "Type S" else 0.50) if wall.unreinforced_condition == "Fully grouted hollow" else (0.40 if wall.mortar_type == "Type S" else 0.30)
         z = area * length / 6
@@ -113,6 +127,10 @@ def reference(wall):
     volume = length * height * thickness / 1e9
     density = 2100 if not reinforced and wall.unreinforced_condition == "Solid units" else 0.56 * 2100 + 0.44 * filled_fraction * 2350
     weight = volume * density * 9.81 / 1000
+    if partial and wall.horizontal_reinforcement_area > 0:
+        # Declared bond-beam courses: (1 - s_f)(1 - glf) t lw (n x 200 mm) rho_g g (F-042).
+        courses = int(height // 200) * 200
+        weight += 0.44 * (1 - filled_fraction) * thickness * length * courses / 1e9 * 2350 * 9.81 / 1000
     pd = 0.9 * (150 + weight) + min(0.0, wall.factored_axial)
     dv = 0.8 * length
     shear_n = wall.factored_shear * 1000
@@ -135,7 +153,9 @@ def reference(wall):
             beta = 0.18 if av >= minimum else 230 / (1000 + 1.4 * dv)
             ze = 300 if av >= minimum else 1.4 * dv
             eps = max(0, min(0.003, (max(moment_nmm, shear_n * dv) / dv + shear_n - 500 * wall.factored_axial) / (2 * 200000 * 600)))
-            if wall.factored_axial < 0:
+            # 11.10.2.6.3(e): doubled only when the axial tension leaves no compression zone (F-065).
+            e_t = sum(x * (x - length / 2) for x in bars) / sum(bars)
+            if wall.factored_axial < 0 and wall.factored_moment <= -wall.factored_axial * e_t / 1000:
                 eps = min(0.003, 2 * eps)
             routes = [(beta, 42), (0.4 / (1 + 1500 * eps) * 1300 / (1000 + ze), 29 + 7000 * eps)]
         capacities = []
@@ -157,6 +177,7 @@ def main():
         *[("Unreinforced masonry", "Discrete", condition) for condition in ("Hollow ungrouted", "Fully grouted hollow", "Solid units")],
     ]
     count = 0
+    undefined = 0
     largest_mr_error = 0.0
     for edition, mortar, strength, route, load_index in product(("S304-14", "S304:24"), ("Type S", "Type N"), (15, 30), routes, range(4)):
         kind, method, condition = route
@@ -170,6 +191,9 @@ def main():
             least_clear_cell_dimension=min(100.0, thickness - 2 * {140: 26, 190: 36.2, 240: 38.6, 290: 41.4}[thickness]),
             height=(3000, 5000, 7500, 5000)[load_index], bar_count=5 if reinforced else 0,
             horizontal_bar_size="15M", horizontal_anchorage_confirmed=True, horizontal_continuity_confirmed=True,
+            bond_beam_anchorage="standard_hook",  # F-080: hook-anchored 15M bond-beam bars
+            bond_beam_levels_above_section=int((3000, 5000, 7500, 5000)[load_index] // 200),
+            bond_beam_course_height=200.0,  # F-042: declared courses above the base section
             grout_type="Coarse",  # the reference takes ga = 1.4 (coarse grout)
             factored_shear=(0, 100, 100, 250)[load_index], factored_moment=(0, 50, 800, 200)[load_index],
             shear_method=("Simplified", "General", "Use lower of simplified and general", "General")[load_index],
@@ -183,11 +207,19 @@ def main():
             actual = calculate_wall(replace(case, dead_load_compression=expected[4], pd_basis="independent case rule"))
             calculated = (actual.section.area, actual.axial_cap, actual.moment_resistance, actual.self_weight, actual.pd, actual.shear.resistance, actual.sliding.resistance)
             for index, (got, want) in enumerate(zip(calculated, expected)):
+                if want is None:  # Mr undefined (deep-section model outside its range, F-058)
+                    assert got is None and actual.moment_resistance_reason == "deep_section_model_outside_range", (
+                        count, case, index, got, want)
+                    continue
                 tolerance = max(1e-7, abs(want) * 1e-10)
                 assert got is not None and abs(got - want) <= tolerance, (count, case, index, got, want)
-            largest_mr_error = max(largest_mr_error, abs(actual.moment_resistance - expected[2]))
+            if expected[2] is None:
+                undefined += 1
+            else:
+                largest_mr_error = max(largest_mr_error, abs(actual.moment_resistance - expected[2]))
             count += 1
-    print(f"INDEPENDENT_EQUATIONS=PASS cases={count}; maximum Mr equilibrium difference={largest_mr_error:.9f} kN-m")
+    print(f"INDEPENDENT_EQUATIONS=PASS cases={count}; maximum Mr equilibrium difference={largest_mr_error:.9f} kN-m; "
+          f"Mr undefined by the deep-section range in {undefined} cases (both sides)")
 
 
 if __name__ == "__main__":

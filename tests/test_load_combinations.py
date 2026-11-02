@@ -264,7 +264,10 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(len(lc.check_load_cases(self.wall, [self.case, replace(self.case, enabled=False)]).results), 2)
 
     def test_partial_grout_names_and_resistances_are_correct_for_each_pf(self):
-        wall = replace(self.wall, wall_type="Partially grouted reinforced masonry")
+        # F-071: the engine default is now "Discrete" (register I-9); this test
+        # selects the "lower of" envelope explicitly.
+        wall = replace(self.wall, wall_type="Partially grouted reinforced masonry",
+                       partial_grout_method="Use lower of discrete and smeared")
         cases = [replace(self.case, case_id=f"P{p}", actions=lc.Action(p, 10, 1)) for p in (-100, 0, 200, 1000)]
         for member in lc.check_load_cases(wall, cases).results:
             result = member.result

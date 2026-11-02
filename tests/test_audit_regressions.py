@@ -20,9 +20,17 @@ def WallInput(**values):  # noqa: N802 - fixture with the engine's signature
 
 class AuditRegressions(unittest.TestCase):
     def test_squat_uplift_has_no_interpolated_false_positive_moment(self):
+        # F-058 (replaces the pinned Mr = 0): the reduced-arm moment of this squat
+        # wall in net tension is negative (raw -2.42 kN-m), so the deep-section
+        # model is outside its range: no Mr, and the P-M check is a coverage gap
+        # citing 10.2.8 instead of a FAIL against a clipped zero (register I-10).
         result = calculate_wall(WallInput(length=5000.0, height=3000.0, thickness=140.0, nominal_unit_strength=30.0, factored_axial=-272.0, factored_moment=0.5))
-        self.assertEqual(result.moment_resistance, 0.0)
-        self.assertEqual(next(c.level for c in result.checks if c.title == "Axial load plus in-plane moment"), "blocked")
+        self.assertIsNone(result.moment_resistance)
+        self.assertEqual(result.moment_resistance_reason, "deep_section_model_outside_range")
+        check = next(c for c in result.checks if c.title == "Axial load plus in-plane moment")
+        self.assertEqual((check.level, check.unresolved), ("blocked", "unsupported"))
+        self.assertIn("10.2.8", check.clause)
+        self.assertIn("I-10", check.detail)
 
     def test_contiguous_grouted_cells_use_fully_grouted_shear_rules(self):
         for edition in ("S304-14", "S304:24"):
@@ -70,7 +78,9 @@ class AuditRegressions(unittest.TestCase):
         calculate_wall(WallInput(horizontal_reinforcement_type="Joint reinforcement", horizontal_fy=485.0))
 
     def test_short_or_discontinuous_horizontal_steel_is_not_credited(self):
-        base = WallInput(edition="S304:24", horizontal_reinforcement_type="Bond beam bars", horizontal_reinforcement_area=200.0, horizontal_anchorage_confirmed=True, horizontal_continuity_confirmed=True)
+        # F-080 / F-074: two 10M bars per level (Av 200 > Ab 100) with a declared
+        # end anchorage (hook) and a declared 40 mm clear spacing inside the beam.
+        base = WallInput(edition="S304:24", horizontal_reinforcement_type="Bond beam bars", horizontal_reinforcement_area=200.0, bond_beam_anchorage="standard_hook", bars_per_bond_beam=2, bond_beam_bar_clear_spacing=40.0, horizontal_continuity_confirmed=True)
         self.assertGreater(calculate_wall(base).shear.steel_resistance, 0.0)
         for changes in ({"available_horizontal_development": 100.0}, {"horizontal_continuity_confirmed": False}):
             result = calculate_wall(replace(base, **changes))
@@ -91,7 +101,11 @@ class AuditRegressions(unittest.TestCase):
         fraction = 300 / full.detailing.vertical_development_required
         self.assertAlmostEqual(short.shear.epsilon_x, min(0.003, full.shear.epsilon_x / fraction))
         self.assertLess(short.shear.resistance, full.shear.resistance)
-        self.assertEqual(short.sliding.developed_vertical_area, 0.0)
+        # F-047: S304:24 credits the dowel force that can be developed (Clause 3
+        # C), As,dev x kdev = 1000 x 300/411.44 mm2; S304-14 stays all-or-nothing.
+        self.assertAlmostEqual(short.sliding.developed_vertical_area, 1000.0 * fraction)
+        s304_14 = calculate_wall(replace(base, edition="S304-14", available_vertical_development=300.0))
+        self.assertEqual(s304_14.sliding.developed_vertical_area, 0.0)
 
     def test_uplift_is_deducted_from_sliding_clamping(self):
         # WP2 (F-003): the clamping force is the case Pd, never Pf; a case whose

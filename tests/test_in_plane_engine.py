@@ -275,12 +275,19 @@ class InPlaneEngineTests(unittest.TestCase):
                 horizontal_reinforcement_area=200.0,
                 horizontal_reinforcement_spacing=200.0,
                 horizontal_anchorage_confirmed=False,
+                # F-074: two 10M bars per level (Av 200 > Ab 100) at a declared
+                # 40 mm clear spacing inside the bond beam.
+                bars_per_bond_beam=2,
+                bond_beam_bar_clear_spacing=40.0,
             )
         )
+        # F-080: bond-beam bars are credited only with a declared end anchorage
+        # (a standard hook anchors 15M and smaller bars, 12.4.11.2 / 13.4.11.2).
+        self.assertIsNone(unanchored.wall.bond_beam_anchorage)
         anchored = calculate_wall(
             replace(
                 unanchored.wall,
-                horizontal_anchorage_confirmed=True,
+                bond_beam_anchorage="standard_hook",
                 horizontal_continuity_confirmed=True,
             )
         )
@@ -288,24 +295,37 @@ class InPlaneEngineTests(unittest.TestCase):
         self.assertGreater(anchored.shear.steel_resistance, 0.0)
 
     def test_bond_beam_development_is_checked(self) -> None:
-        result = calculate_wall(
-            replace(
-                self.example,
-                horizontal_reinforcement_type="Bond beam bars",
-                horizontal_reinforcement_area=200.0,
-                horizontal_bar_size="15M",
-                horizontal_anchorage_confirmed=True,
-                horizontal_continuity_confirmed=True,
-                available_horizontal_development=100.0,
-            )
+        # F-066: the item is a requirement only where the steel is needed for
+        # in-plane shear; Vf = 300 kN exceeds Vr without horizontal steel
+        # (267.3 kN), so the short development is blocked.
+        wall = replace(
+            self.example,
+            factored_shear=300.0,
+            horizontal_reinforcement_type="Bond beam bars",
+            horizontal_reinforcement_area=200.0,
+            horizontal_bar_size="15M",
+            bond_beam_anchorage="standard_hook",
+            horizontal_continuity_confirmed=True,
+            available_horizontal_development=100.0,
         )
+        result = calculate_wall(wall)
         check = next(c for c in result.checks if c.title == "Bond-beam-bar development")
         self.assertEqual(check.level, "blocked")
+        self.assertEqual(result.shear.steel_resistance, 0.0)
+        # At Vf = 200 kN <= Vm = 233.96 kN the steel is not required: information only.
+        not_required = calculate_wall(replace(wall, factored_shear=200.0))
+        check = next(c for c in not_required.checks if c.title == "Bond-beam-bar development")
+        self.assertEqual((check.level, check.kind), ("pass", "info"))
+        self.assertIn("Not required for in-plane shear", check.detail)
 
     def test_joint_reinforcement_uses_600_mm_and_wire_diameter_limits(self) -> None:
+        # F-066: the spacing limit applies where the steel is required for
+        # in-plane shear (Vf = 300 kN > Vr without it, 267.3 kN); the 12.1.4
+        # wire-diameter limit is unconditional.
         result = calculate_wall(
             replace(
                 self.example,
+                factored_shear=300.0,
                 horizontal_reinforcement_type="Joint reinforcement",
                 horizontal_reinforcement_area=21.0,
                 horizontal_reinforcement_spacing=800.0,
@@ -387,7 +407,8 @@ class InPlaneEngineTests(unittest.TestCase):
                 bond_pattern="Stack pattern",
                 horizontal_reinforcement_type="Bond beam bars",
                 horizontal_reinforcement_area=200.0,
-                horizontal_anchorage_confirmed=True,
+                bond_beam_anchorage="standard_hook",  # F-080: declared end anchorage
+                bars_per_bond_beam=2, bond_beam_bar_clear_spacing=40.0,  # F-074: two 10M per level
                 horizontal_continuity_confirmed=True,
                 stack_joint_area=1000.0,
                 stack_vertical_shear=150.0,
@@ -421,13 +442,17 @@ class InPlaneEngineTests(unittest.TestCase):
             horizontal_reinforcement_type="Bond beam bars",
             horizontal_bar_size="15M",
             horizontal_reinforcement_area=200.0,
-            horizontal_anchorage_confirmed=True,
+            bond_beam_anchorage="standard_hook",  # F-080: declared end anchorage
             horizontal_continuity_confirmed=True,
             base_connection_confirmed=True,
             top_connection_confirmed=True,
             oop_check_provided=True,
             oop_stability_passed=True,
             oop_utilization=0.05,
+            # WP3: declared not part of the SFRS, in a case without E, and the
+            # wall role declared (no seismic or infill gate applies).
+            sfrs_wall=False,
+            wall_role="loadbearing_shear_wall",
         )
         for edition in ("S304-14", "S304:24"):
             result = calculate_wall(replace(wall, edition=edition))

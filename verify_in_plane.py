@@ -23,6 +23,7 @@ def complete_wall(**changes: object) -> WallInput:
         horizontal_reinforcement_spacing=200.0,
         horizontal_anchorage_confirmed=True,
         horizontal_continuity_confirmed=True,
+        bond_beam_anchorage="standard_hook",  # F-080: declared end anchorage of the 15M bond-beam bars
         unit_geometry_confirmed=True,
         # Declared unit geometry (190 mm unit; comparison-workbook values): bedded and S304:24 minimum.
         face_shell_thickness=36.2,
@@ -33,6 +34,11 @@ def complete_wall(**changes: object) -> WallInput:
         oop_check_provided=True,
         oop_stability_passed=True,
         oop_utilization=0.05,
+        # WP3: the matrix walls are declared not part of the SFRS in cases
+        # without E, loadbearing, and URM permitted where URM is checked.
+        sfrs_wall=False,
+        wall_role="loadbearing_shear_wall",
+        urm_seismic_permitted=True,
     )
     return replace(base, **changes)
 
@@ -64,7 +70,11 @@ def main() -> None:
         # The uplift case's lateral axial load exceeds 0.9 D_cnt by 100 kN: Pd_case = -100 kN.
         Case("reinforced-uplift", complete_wall(factored_axial=-100.0, factored_moment=200.0, factored_shear=100.0, shear_method="General",
                                                 dead_load_compression=-100.0)),
-        Case("partial-grout-lower", complete_wall(wall_type="Partially grouted reinforced masonry")),
+        # F-071: the default is now Discrete; this case keeps the "lower of" envelope. F-042: the
+        # 15M bond beams at 200 mm are 25 declared 200 mm courses above the base section.
+        Case("partial-grout-lower", complete_wall(wall_type="Partially grouted reinforced masonry",
+                                                  partial_grout_method="Use lower of discrete and smeared",
+                                                  bond_beam_levels_above_section=25, bond_beam_course_height=200.0)),
         Case("unreinforced-hollow", complete_wall(wall_type="Unreinforced masonry", unreinforced_condition="Hollow ungrouted", bar_count=0, factored_shear=25.0, factored_moment=100.0, horizontal_reinforcement_type="None", horizontal_reinforcement_area=0.0)),
         Case("unreinforced-fully-grouted", complete_wall(wall_type="Unreinforced masonry", unreinforced_condition="Fully grouted hollow", bar_count=0, factored_shear=25.0, factored_moment=100.0, horizontal_reinforcement_type="None", horizontal_reinforcement_area=0.0)),
         Case("unreinforced-solid", complete_wall(wall_type="Unreinforced masonry", unreinforced_condition="Solid units", bar_count=0, factored_shear=25.0, factored_moment=100.0, horizontal_reinforcement_type="None", horizontal_reinforcement_area=0.0)),
@@ -74,7 +84,9 @@ def main() -> None:
         Case("joint-reinforcement", complete_wall(horizontal_reinforcement_type="Joint reinforcement", horizontal_reinforcement_area=21.0, horizontal_reinforcement_spacing=200.0, factored_shear=150.0)),
         Case("bad-development", complete_wall(available_vertical_development=100.0), True),
         Case("bad-vertical-spacing", complete_wall(length=10_000.0, height=10_000.0, bar_count=2), True),
-        Case("unanchored-horizontal-steel", complete_wall(horizontal_anchorage_confirmed=False), True),
+        # F-080: bond-beam anchorage is the declared bond_beam_anchorage; F-066: Vf = 300 kN needs the
+        # steel in both editions (S304-14 Vr without it 267.3 kN), so the missing anchorage blocks.
+        Case("unanchored-horizontal-steel", complete_wall(bond_beam_anchorage=None, factored_shear=300.0), True),
         Case("missing-oop-interface", complete_wall(oop_check_provided=False), True),
         Case("missing-base-connection", complete_wall(base_connection_confirmed=False), True),
     )
