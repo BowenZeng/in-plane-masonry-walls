@@ -4,7 +4,18 @@ from dataclasses import replace
 import math
 import unittest
 
-from in_plane_engine import CalculationError, WallInput, calculate_wall, ties_qualify, wall_self_weight
+from in_plane_engine import CalculationError, UNIT_FACE_SHELL_REFERENCE, calculate_wall, ties_qualify, wall_self_weight
+from in_plane_engine import WallInput as _EngineWallInput
+
+
+def WallInput(**values):  # noqa: N802 - fixture with the engine's signature
+    """WP4: the least clear cell has no engine default; fixtures declare the unit's
+    cell, min(100, t - 2 tf) with the reference mortar-bedded face shell."""
+    if "least_clear_cell_dimension" not in values:
+        t = values.get("thickness", 190.0)
+        tf = values.get("face_shell_thickness") or UNIT_FACE_SHELL_REFERENCE["mortar_bedded"][float(t)]
+        values["least_clear_cell_dimension"] = min(100.0, t - 2.0 * tf)
+    return _EngineWallInput(**values)
 
 
 class AuditRegressions(unittest.TestCase):

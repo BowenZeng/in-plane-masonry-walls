@@ -257,7 +257,10 @@ class WallInput:
     vertical_bars_developed_at_base: bool = True
     developed_vertical_bar_count: int | None = None
     in_situ_grout_strength: float = 20.0
-    least_clear_cell_dimension: float = 100.0
+    # Least clear dimension of the reinforced cell (mm): declared, no default.
+    # Required for reinforced walls and bond beams; it is one cell with the
+    # grouted-cell width and lies inside the hollow core t - 2 tf.
+    least_clear_cell_dimension: float | None = None
     epoxy_coated_vertical_bars: bool = False
     available_vertical_development: float = 1200.0
     available_horizontal_development: float = 600.0
@@ -341,6 +344,7 @@ class ShearResult:
     stack_vertical_resistance: float | None = None
     ze_basis: str = ""
     grout_assumed: bool = False
+    epsilon_x_basis: str = ""
 
 
 @dataclass(frozen=True)
@@ -494,6 +498,33 @@ def _bedded_tf(wall: WallInput) -> float:
     return _reference_face_shell("mortar_bedded", wall.thickness)
 
 
+def _reference_bedded_tf(wall: WallInput) -> float | None:
+    if wall.face_shell_thickness is not None:
+        return wall.face_shell_thickness
+    return UNIT_FACE_SHELL_REFERENCE["mortar_bedded"].get(float(wall.thickness))
+
+
+def _validate_cell(wall: WallInput) -> None:
+    """The declared clear cell is one cell inside the unit (F-053, F-152, R06)."""
+    needs_cell = wall.wall_type != "Unreinforced masonry" or wall.horizontal_reinforcement_type == "Bond beam bars"
+    clear = wall.least_clear_cell_dimension
+    if clear is None:
+        if needs_cell:
+            raise CalculationError("Declare the least clear dimension of the reinforced cell "
+                                   "(least_clear_cell_dimension); it has no default.")
+        return
+    if not math.isfinite(clear) or clear <= 0.0:
+        raise CalculationError("Least clear cell dimension must be positive and finite.")
+    tf = _reference_bedded_tf(wall)
+    if tf is not None and clear > wall.thickness - 2.0 * tf + 1.0e-9:
+        raise CalculationError(f"Least clear cell dimension {clear:.1f} mm exceeds the hollow core of the unit, "
+                               f"t - 2 tf = {wall.thickness - 2.0 * tf:.1f} mm.")
+    if (wall.wall_type == "Partially grouted reinforced masonry"
+            and wall.grouted_cell_width < clear - 1.0e-9):
+        raise CalculationError(f"Grouted-cell width {wall.grouted_cell_width:.1f} mm is less than the least clear "
+                               f"cell dimension {clear:.1f} mm; the two fields describe one cell.")
+
+
 def _validate(wall: WallInput) -> None:
     positive = {
         "length": wall.length,
@@ -504,7 +535,6 @@ def _validate(wall: WallInput) -> None:
         "steel yield strength": wall.fy,
         "horizontal steel yield strength": wall.horizontal_fy,
         "in-situ grout strength": wall.in_situ_grout_strength,
-        "least clear cell dimension": wall.least_clear_cell_dimension,
         "available vertical development": wall.available_vertical_development,
         "available horizontal development": wall.available_horizontal_development,
         "masonry density": wall.masonry_density,
@@ -635,6 +665,7 @@ def _validate(wall: WallInput) -> None:
         raise CalculationError("Developed vertical-bar count must be between zero and the total bar count.")
     if wall.splice_class not in ("A", "B"):
         raise CalculationError("Splice class must be A or B.")
+    _validate_cell(wall)
 
 
 def _bar_positions(wall: WallInput) -> tuple[float, ...]:
@@ -921,7 +952,7 @@ def _detailing_result(
         horizontal_development_required=horizontal_ld,
         lap_required=lap_required,
         termination_extension_required=max(extreme_depth, 12.0 * vertical_diameter),
-        vertical_clearance_limit=wall.least_clear_cell_dimension / 2.0,
+        vertical_clearance_limit=(wall.least_clear_cell_dimension or 0.0) / 2.0,
         vertical_bar_diameter=vertical_diameter,
         horizontal_bar_diameter=horizontal_diameter,
     )
@@ -994,7 +1025,8 @@ def section_point_at_c(
     if squat:
         design_depth = min(0.67 * wall.length, 0.70 * wall.height)
         if wall.edition == "S304:24":
-            tensile_centroid = sum(x for x, _ in tension) / len(tension)
+            # Force-weighted resultant of the tension bars (F-068; register I-10).
+            tensile_centroid = sum(x * t for x, t in tension) / sum(t for _, t in tension)
             design_depth = min(design_depth, tensile_centroid)
     else:
         design_depth = None
@@ -1181,6 +1213,7 @@ def _shear_result(
     epsilon_x: float | None = None
     ze: float | None = None
     ze_basis = ""
+    epsilon_basis = ""
     grout_assumed = False
     if wall.edition == "S304:24" and reinforced:
         minimum_av_2024 = 0.35 * wall.thickness * spacing / horizontal_fy
@@ -1249,9 +1282,17 @@ def _shear_result(
             else:
                 ze, ze_basis = 1.4 * zs, ("ze = ga zs; grout type not declared, candidate ga = 1.4, bounded by the "
                                           "simplified route (register I-15)")
-            tension_half_area = developed_fraction * BAR_AREAS[wall.bar_size] * sum(
-                position >= section.centroid for position in section.bar_positions
+            # Bars in the flexural tension half, measured from the geometric
+            # mid-length (not the section centroid); a bar at mid-length is
+            # included by TENSION_HALF_BOUNDARY_BAR (register I-6, F-057).
+            half, tolerance = 0.5 * wall.length, 1.0e-6 * wall.length
+            tension_bars = sum(
+                (position >= half - tolerance) if TENSION_HALF_BOUNDARY_BAR == "include" else (position > half + tolerance)
+                for position in section.bar_positions
             )
+            tension_half_area = developed_fraction * BAR_AREAS[wall.bar_size] * tension_bars
+            epsilon_basis = (f"As = {tension_half_area:.1f} mm2: {tension_bars} bars in the tension half (x >= 0.5 lw; "
+                             f"bar at mid-length {TENSION_HALF_BOUNDARY_BAR}d, tolerance 1e-6 lw, register I-6)")
             design_moment = max(
                 wall.factored_moment * 1_000_000.0,
                 wall.factored_shear * 1000.0 * dv,
@@ -1380,6 +1421,7 @@ def _shear_result(
         stack_vertical_resistance=stack_resistance,
         ze_basis=ze_basis,
         grout_assumed=grout_assumed,
+        epsilon_x_basis=epsilon_basis,
     )
 
 
@@ -1691,18 +1733,36 @@ def _checks(
                 unresolved="incomplete" if wall.provided_lap_length is None else "",
             )
         add(
-            wall.vertical_bars_continuous
-            or wall.available_termination_extension >= detailing.termination_extension_required - 1.0e-8,
-            "Vertical-bar continuity or termination extension",
-            (
-                "Bars are continuous over the wall height."
-                if wall.vertical_bars_continuous
-                else f"Available extension = {wall.available_termination_extension:.0f} mm; required = {detailing.termination_extension_required:.0f} mm."
-            ),
-            "12.4.8.3" if wall.edition == "S304-14" else "13.4.8.3",
-            check_id="ip.vertical_bar_continuity_or_termination_extension",
+            wall.vertical_bars_continuous,
+            "Minimum vertical reinforcement continuity",
+            "Bars are declared continuous over the wall height." if wall.vertical_bars_continuous else
+            ("Bars declared not continuous and no continuing-bar layout entered: the 10.15.1.1 minimum must be "
+             "continuous; terminated-bar layouts (continuing bars, cut-off height, 12.4.8.4 embedment, 12.4.8.5 "
+             "cut-off shear) are not modelled (register I-20)."),
+            "10.15.1.2(a)/(b)" if wall.edition == "S304-14" else "11.15.1.2 a)/b)",
+            check_id="ip.minimum_vertical_reinforcement_continuity",
             kind="numeric",
+            unresolved="unsupported",
         )
+        if wall.vertical_bars_continuous:
+            add(True, "Vertical-bar continuity or termination extension", "Bars are continuous over the wall height.",
+                "12.4.8.3" if wall.edition == "S304-14" else "13.4.8.3",
+                check_id="ip.vertical_bar_continuity_or_termination_extension", kind="numeric")
+        else:
+            add(
+                wall.available_termination_extension >= detailing.termination_extension_required - 1.0e-8,
+                "Vertical-bar continuity or termination extension",
+                f"Available extension = {wall.available_termination_extension:.0f} mm; required = "
+                f"{detailing.termination_extension_required:.0f} mm = max(d, 12 db) past the flexural cut-off.",
+                "12.4.8.3" if wall.edition == "S304-14" else "13.4.8.3",
+                check_id="ip.vertical_bar_continuity_or_termination_extension",
+                kind="numeric",
+                demand=wall.available_termination_extension,
+                limit=detailing.termination_extension_required,
+                units="mm",
+                comparison=">=",
+                tolerance=1e-8,
+            )
         if wall.compression_reinforcement_tied:
             _, longitudinal_diameter = BAR_PROPERTIES[wall.bar_size]
             tie_limit = min(
@@ -1853,6 +1913,40 @@ def _checks(
             kind="numeric",
             unresolved="incomplete",
         )
+
+    # Column definition (S304-14 2.2; S304:24 3.1): h > 5(t + 10) and lw < 3(t + 10).
+    # Partially grouted and hollow elements are not permitted as columns; a
+    # fully grouted element is checked as a grouted-solid wall element (I-19).
+    column_t = wall.thickness + 10.0
+    tall = wall.height > 5.0 * column_t + 1.0e-9
+    column_sized = tall and wall.length < 3.0 * column_t - 1.0e-9
+    restricted = wall.wall_type == "Partially grouted reinforced masonry" or (
+        wall.wall_type == "Unreinforced masonry" and wall.unreinforced_condition == "Hollow ungrouted")
+    geometry_text = (f"h = {wall.height:.0f} mm vs 5(t + 10) = {5.0 * column_t:.0f} mm; "
+                     f"lw = {wall.length:.0f} mm vs 3(t + 10) = {3.0 * column_t:.0f} mm")
+    if not column_sized:
+        column_text = f"{geometry_text}: not column-sized."
+    elif restricted:
+        column_text = (f"{geometry_text}: column-sized element; partially grouted or hollow elements are not "
+                       "permitted as columns (register I-19).")
+    else:
+        column_text = f"{geometry_text}: column-sized; fully grouted, checked as a grouted-solid wall element."
+    if wall.wall_type == "Unreinforced masonry":
+        column_clause = "2.2 (column); 7.1.2" if wall.edition == "S304-14" else "3.1 (column); 8.1.2"
+    else:
+        column_clause = "2.2 (column); 10.15.4.3" if wall.edition == "S304-14" else "3.1 (column); 11.15.4.3"
+    add(
+        not (column_sized and restricted),
+        "Column dimension limits",
+        column_text,
+        column_clause,
+        check_id="ip.column_dimension_limits",
+        kind="numeric",
+        **(dict(demand=wall.length, limit=3.0 * column_t, units="mm", comparison=">=", tolerance=1e-9)
+           if restricted and tall else
+           dict(demand=wall.height, limit=5.0 * column_t, units="mm", comparison="<=", tolerance=1e-9)
+           if restricted else {}),
+    )
 
     if wall.wall_type == "Unreinforced masonry" and wall.horizontal_reinforcement_type != "None":
         unreinforced_horizontal_ratio = wall.horizontal_reinforcement_area / (
@@ -2215,7 +2309,7 @@ def calculate_wall(wall: WallInput) -> WallResult:
         TraceEntry("Ae", f"{section.area:.1f}", "mm2", "mortar-bedded area plus grouted void area", f"{flex_clause}.3"),
         TraceEntry("tf (Ae)", _fmt(section.face_shell_thickness, 1), "mm",
                    section.face_shell_source or "no ungrouted segment in this section", f"{flex_clause}.3"),
-        TraceEntry("least clear cell", f"{wall.least_clear_cell_dimension:.1f}", "mm", "declared least clear dimension of the reinforced cell",
+        TraceEntry("least clear cell", _fmt(wall.least_clear_cell_dimension, 1), "mm", "declared least clear dimension of the reinforced cell",
                    "12.1.3" if wall.edition == "S304-14" else "13.1.3"),
         TraceEntry("gamma_g", f"{section.gamma_g:.4f}", "-", "1.0 fully grouted; otherwise min(Ae/Ag, 0.5)", shear_clause),
         TraceEntry("Pr,max", f"{cap:.3f}", "kN", "0.80 [sum(0.85 phi_m f'm,i Ai) + eligible compression-steel net force]", f"{flex_clause}.4"),
@@ -2230,7 +2324,8 @@ def calculate_wall(wall: WallInput) -> WallResult:
                    "factor 0.9 in every combination (register I-1); Vm uses 0.25 max(0, Pd)", shear_clause),
         TraceEntry("beta", "-" if shear.beta is None else f"{shear.beta:.6f}", "-", shear.method, shear_clause),
         TraceEntry("theta", "-" if shear.theta_degrees is None else f"{shear.theta_degrees:.3f}", "deg", shear.method, shear_clause),
-        TraceEntry("epsilon_x", "-" if shear.epsilon_x is None else f"{shear.epsilon_x:.7f}", "-", "S304:24 general shear method", shear_clause),
+        TraceEntry("epsilon_x", "-" if shear.epsilon_x is None else f"{shear.epsilon_x:.7f}", "-",
+                   "S304:24 general shear method" + (f"; {shear.epsilon_x_basis}" if shear.epsilon_x_basis else ""), shear_clause),
         TraceEntry("ze", "-" if shear.ze is None else f"{shear.ze:.3f}", "mm",
                    "S304:24 general shear method" + (f"; {shear.ze_basis}" if shear.ze_basis else ""), shear_clause),
         TraceEntry("Vr,slide", _fmt(sliding.resistance), "kN", sliding.method, shear_clause + ".5"),

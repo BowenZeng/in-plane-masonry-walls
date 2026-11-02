@@ -10,6 +10,12 @@ import load_combinations as lc
 import batch_reporting as reports
 
 
+def wall_input(**values):
+    """WP4: fixtures declare the 190 mm unit's least clear cell (no engine default)."""
+    values.setdefault("least_clear_cell_dimension", 100.0)
+    return engine.WallInput(**values)
+
+
 class CombinationTests(unittest.TestCase):
     def test_reference_earthquake_factor_includes_axial_and_both_directions(self):
         cases = lc.generate_load_cases(
@@ -43,7 +49,7 @@ class CombinationTests(unittest.TestCase):
         self.assertEqual({c.case_id: c.actions for c in forward}, {c.case_id: c.actions for c in backward})
 
     def test_self_weight_is_included_once_with_same_dead_basis_for_pd(self):
-        wall = engine.WallInput()
+        wall = wall_input()
         weight = engine.wall_self_weight(wall)
         definitions = [lc.Combination("D14", "1.4D", {"D": 1.4}), lc.Combination("D09", ".9D", {"D": .9})]
         added = lc.generate_load_cases({"D": lc.Action(150, 0, 0)}, definitions, self_weight=weight)
@@ -67,7 +73,7 @@ class CombinationTests(unittest.TestCase):
     def test_invalid_formula_is_visible_and_does_not_suppress_valid_formula(self):
         cases = lc.generate_load_cases({"D": lc.Action(100)},
                                        [lc.Combination("BAD", "bad", {"D": math.nan}), lc.REFERENCE_COMBINATIONS[0]])
-        batch = lc.check_load_cases(engine.WallInput(), cases)
+        batch = lc.check_load_cases(wall_input(), cases)
         self.assertEqual([r.resistance_status for r in batch.results], ["INVALID", "INVALID", "PASS", "PASS"])
         self.assertFalse(batch.all_ip_pass)
 
@@ -87,7 +93,7 @@ class CombinationTests(unittest.TestCase):
 
 class BatchTests(unittest.TestCase):
     def setUp(self):
-        self.wall = engine.WallInput()
+        self.wall = wall_input()
         # WP2: direct cases declare their signed lateral axial load (here none);
         # Pd = 0.9 (D 150 kN + self-weight) from the wall's dead-load basis.
         self.case = lc.LoadCase("C1", "Low demand", lc.Action(200, 50, 20), lateral_axial=0.0)

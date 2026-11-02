@@ -16,13 +16,24 @@ REFERENCE_PD_BASIS = "Example 7.4: 0.9 (150 + 103.0) kN; no lateral axial load"
 from in_plane_engine import (  # noqa: E402
     BAR_AREAS,
     CalculationError,
-    WallInput,
+    UNIT_FACE_SHELL_REFERENCE,
     calculate_wall,
     interaction_curve,
     moment_at_axial_load,
     section_point_at_c,
     section_properties,
 )
+from in_plane_engine import WallInput as _EngineWallInput  # noqa: E402
+
+
+def WallInput(**values):  # noqa: N802 - fixture with the engine's signature
+    """WP4: the least clear cell has no engine default; fixtures declare the unit's
+    cell, min(100, t - 2 tf) with the reference mortar-bedded face shell."""
+    if "least_clear_cell_dimension" not in values:
+        t = values.get("thickness", 190.0)
+        tf = values.get("face_shell_thickness") or UNIT_FACE_SHELL_REFERENCE["mortar_bedded"][float(t)]
+        values["least_clear_cell_dimension"] = min(100.0, t - 2.0 * tf)
+    return _EngineWallInput(**values)
 
 
 class InPlaneEngineTests(unittest.TestCase):

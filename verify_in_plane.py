@@ -27,6 +27,7 @@ def complete_wall(**changes: object) -> WallInput:
         # Declared unit geometry (190 mm unit; comparison-workbook values): bedded and S304:24 minimum.
         face_shell_thickness=36.2,
         minimum_face_shell_thickness=30.0,
+        least_clear_cell_dimension=100.0,  # declared clear cell of the 190 mm unit
         base_connection_confirmed=True,
         top_connection_confirmed=True,
         oop_check_provided=True,
@@ -113,6 +114,7 @@ def main() -> None:
 
     # Reference and cross-edition numerical anchors.
     example = WallInput(
+        least_clear_cell_dimension=100.0,
         factored_axial=200.0,
         factored_moment=1000.0,
         factored_shear=200.0,

@@ -84,7 +84,8 @@ def reference(wall):
         if height < length and tensile_forces:
             reduced_depth = min(0.67 * length, 0.7 * height)
             if wall.edition == "S304:24":
-                reduced_depth = min(reduced_depth, sum(x for x, _ in tensile_forces) / len(tensile_forces))
+                # Force-weighted tension resultant (F-068).
+                reduced_depth = min(reduced_depth, sum(x * t for x, t in tensile_forces) / sum(t for _, t in tensile_forces))
             reduction = sum(tension * (x - reduced_depth) for x, tension in tensile_forces)
             m -= max(0, reduction)
         if not tensile_forces:
@@ -166,6 +167,7 @@ def main():
             wall_type=kind, partial_grout_method=method, unreinforced_condition=condition,
             thickness=thickness, face_shell_thickness={140: 26, 190: 36.2, 240: 38.6, 290: 41.4}[thickness],
             minimum_face_shell_thickness={140: 25, 190: 30, 240: 35, 290: 35}[thickness],
+            least_clear_cell_dimension=min(100.0, thickness - 2 * {140: 26, 190: 36.2, 240: 38.6, 290: 41.4}[thickness]),
             height=(3000, 5000, 7500, 5000)[load_index], bar_count=5 if reinforced else 0,
             horizontal_bar_size="15M", horizontal_anchorage_confirmed=True, horizontal_continuity_confirmed=True,
             grout_type="Coarse",  # the reference takes ga = 1.4 (coarse grout)
