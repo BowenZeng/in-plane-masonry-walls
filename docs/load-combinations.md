@@ -2,10 +2,22 @@
 
 The batch layer evaluates the same wall section under multiple concurrent action
 sets using the existing CSA S304-14 and S304:24 resistance engine. It does not
-perform building analysis, calculate second-order actions, or establish that the
-reference combinations cover a particular project. CSA S304:24 Clause 5.2.2
-refers ultimate combinations to NBCC. Resistance equations and the previously
-documented edition/errata scope are unchanged.
+perform building analysis or calculate second-order actions. CSA S304:24 Clause
+5.2.2 refers ultimate combinations to the NBC. Two load sets come from
+`nbc_load_sets.py`:
+
+- **NBC 2025 Table 4.1.3.2.-A** (`NBC2025_COMBINATIONS(conditions)`): the 21
+  formulas / 33 cases of one L and one S, with the companion-zero rows of
+  4.1.3.2.(3), both 1.25D and 0.9D, 1.5H in cases 2 to 4, the storage increase of
+  4.1.3.2.(7), Note (6) / 4.1.5.5 for a separate roof live load (22 / 35) or a
+  parking deck (deck snow 0.2 in case 2, no deck L in the S-principal rows), and
+  the declared dead-load parts. The rows need the declared `LoadConditions`
+  (importance category, occupancy, roof live load, deck, parts). Crane loads are
+  excluded; there is no 0.9D + E row.
+- **Legacy 14-row reference set** (`REFERENCE_COMBINATIONS`): the earlier rows,
+  labelled by content (ten equal S304-14 4.2.2.2 rows; R06 / R07 its case 3 with
+  the Note (4) companion 1.0L; R02 / R03 match no supplied table). It is not an
+  NBC 2025 set.
 
 ## Inputs and signs
 
@@ -46,12 +58,13 @@ self-weight** and enter:
 | E | 0 | 0 | 0 |
 | Other | 0 | 0 | 0 |
 
-For reference formula R10, `1.25D + 0.5L + 1.4W`, the two cases are:
+For legacy formula R10, `1.25D + 0.5L + 1.4W`, the two cases are (Pd_case =
+0.9 x 252.980475 + min(0, the case's signed factored W axial load)):
 
-| Case | Pf (kN) | signed Mf (kNm) | signed Vf (kN) | Pd (kN) |
-| --- | ---: | ---: | ---: | ---: |
-| R10[W+] | 304.225594 | 560 | 112 | 227.682428 |
-| R10[W-] | 388.225594 | -560 | -112 | 227.682428 |
+| Case | Pf (kN) | signed Mf (kNm) | signed Vf (kN) | N_lat (kN) | Pd (kN) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| R10[W+] | 304.225594 | 560 | 112 | -42 | 185.682428 |
+| R10[W-] | 388.225594 | -560 | -112 | 42 | 227.682428 |
 
 Each reversal applies to the entire wind vector, including P. The D and L
 contributions retain their signs. The same rule applies to E, including its axial
@@ -59,6 +72,15 @@ component. A custom formula containing W and E produces all four sign pairings.
 The 14 reference formulas produce 23 cases, including separate IDs when zero
 contributions make some totals identical. No resistance is reused from a selected
 combination: flexure, demand-dependent shear, and sliding are checked per case.
+
+**Pd per case.** Pd_case = 0.9 D_cnt + min(0, N_lat - N_cb) + N_cb (`case_pd`):
+D_cnt is the counteracting dead load (D plus the added self-weight, plus soil only
+where it resists, never the partition allowance), N_lat the case's signed
+factored W and E axial loads including their non-reversible parts, and N_cb the
+part declared coupling-beam axial load (`coupling_beam_axial`), the only part that
+may add compression. The factor is 0.9 in every combination, including NBC load
+case 5 (register I-1). Live and snow loads never enter Pd. The sliding clamping
+force is max(0, Pd_case + phi_s As,dev fy kdev), never Pf.
 
 If D already contains the wall weight, enter total D = 252.980475 kN and choose
 **Already included in D**; this produces the same actions and Pd. Automatically
@@ -69,8 +91,9 @@ sidebar's direct-case D inputs do not supply a second dead-load contribution.
 Only use linear superposition where it is appropriate. If final actions require
 combination-specific second-order/nonlinear analysis, use **Copy generated cases
 to direct mode**, then replace the concurrent P/M/V with that analysis's totals.
-Copy replaces the direct table, retains generation provenance and total D-for-Pd,
-and does not reapply factors or self-weight. Existing supplemental values copied
+Copy replaces the direct table, retains generation provenance, D_cnt and the
+signed lateral axial loads (so each copied case keeps its Pd), and does not
+reapply factors or self-weight. Existing supplemental values copied
 with the cases require review against the direct-case inputs.
 
 ## Direct actions: worked example
@@ -81,25 +104,24 @@ P = -100 kN, M = -250 kNm, and V = -60 kN. These are final actions; the program
 does not automatically reverse, refactor, or add weight to them. The solver uses
 P = -100, |M| = 250, |V| = 60, retaining the original signs in exports.
 
-For direct cases, blank **D for Pd (kN)** uses the sidebar's unfactored dead load
-and its self-weight inclusion setting. Alternatively enter total unfactored dead
-load, including applicable wall weight, in the row; then Pd defaults to 0.9 times
-that total. This is useful for cases copied from generated mode. The independent
-**Direct factored Pd** override is entered in the selected case's supplemental
-form, not multiplied by the combination D factor. A negative total D cannot define
-default compressive Pd and requires an explicit valid basis/override. Coupled-wall
-effects are outside this engine's supported scope.
+Each direct case declares its **signed lateral axial load** (the factored W/E
+axial force of that case, uplift negative). Without it the case's sliding check and
+the Pd-dependent shear routes are INCOMPLETE: the engine has no Pd fallback
+(register I-2). **Counteracting dead load D_cnt** may be entered per row; blank uses
+the sidebar's counteracting dead load and its self-weight setting. An optional
+**coupling-beam axial** part may add compression to Pd. A Pd from an external
+analysis can be entered instead in the selected case's supplemental form as a
+signed value with its source. A negative D_cnt is refused.
 
 ## Case-specific inputs and OOP
 
 Use **Case-specific inputs and linked OOP results** for the selected case. It stores
-Pd override, uncracked-area fraction, optional vertical joint demand override,
-and separate OOP utilization/stability/reference for each edition.
+a signed, sourced Pd override, uncracked-area fraction, optional vertical joint
+demand override, and separate OOP utilization/stability/reference for each edition.
 
-New cases default to zero uncracked-bond credit. The original direct case retains
-the previous 0.5 fraction, subject to review when its wall/actions change. Credit
-an uncracked fraction only when established for that case. Base/support sliding
-does not use this fraction.
+Every case, including the initial direct case, starts with zero uncracked-bond
+credit (F-045). Credit an uncracked fraction only when established for that case.
+Base/support sliding does not use this fraction.
 
 For stack-pattern walls, supply the shared assessed head-joint crossing area and
 the concurrent **Joint V**. Generated mode combines signed joint contributions
@@ -121,12 +143,15 @@ axial force. Missing OOP results never receive assumed passing values.
 - **PASS**: the implemented IP resistance checks pass for that case and edition.
 - **FAIL**: a known demand exceeds resistance, including axial overload or positive
   demand with zero resistance. Undefined P–M utilization remains blank, not zero.
-- **INCOMPLETE**: a required demand/resistance input is missing or stale.
+- **INCOMPLETE**: a required demand/resistance input or declaration is missing or
+  stale (for example the case's signed lateral axial load).
 - **INVALID**: malformed, unsupported, nonfinite, or conflicting inputs prevented
   evaluation. Other valid cases still run.
 
-Additional checks report outstanding detailing, connections, OOP and other engine
-checks separately. “All entered IP resistance cases pass” requires every enabled
+Additional checks report outstanding detailing, connections, OOP, the seismic
+gate (`ip.seismic_provisions_not_evaluated`, every SFRS wall and earthquake case)
+and other engine checks separately; their statuses come from
+`batch_reporting.check_status` (INFO, PASS, INCOMPLETE, UNSUPPORTED, BLOCKED). “All entered IP resistance cases pass” requires every enabled
 case and edition to pass the implemented resistance checks; it is not a wall-level
 CSA compliance certificate. The existing additive IP/OOP utilization remains a
 separately labelled rational interaction screen.
@@ -150,14 +175,20 @@ download the reports before ending the session.
 
 ```python
 from in_plane_engine import WallInput, wall_self_weight
-from load_combinations import Action, generate_load_cases, check_load_cases
+from load_combinations import Action, NBC2025_COMBINATIONS, generate_load_cases, check_load_cases
+from nbc_load_sets import LoadConditions
 
-wall = WallInput()
+wall = WallInput(least_clear_cell_dimension=100.0)
+conditions = LoadConditions(importance_category="Normal", uls_specified=True, occupancy="ordinary",
+                            roof_live_load="included_in_L", parking_deck="none")
 cases = generate_load_cases(
-    {"D": Action(150, 0, 0), "L": Action(60, 0, 0), "W": Action(-30, 400, 80)},
+    {"D": Action(150, 0, 0), "L": Action(60, 0, 0), "S": Action(), "W": Action(-30, 400, 80),
+     "E": Action(), "H": Action()},
+    NBC2025_COMBINATIONS(conditions),
     self_weight=wall_self_weight(wall),
+    conditions=conditions,
     section="Base",
-    load_basis="Project analysis and adopted NBCC combination basis",
+    load_basis="Project analysis; NBC 2025 Table 4.1.3.2.-A",
 )
 batch = check_load_cases(wall, cases)
 for row in batch.governing:
@@ -167,7 +198,8 @@ for row in batch.governing:
 Direct callers construct `LoadCase` objects. Optional `CaseSupplement` values are
 keyed by case ID and reviewed with `review_supplement(wall, case, supplement)`;
 `LinkedOOP` values are keyed by edition. The batch API replaces case-dependent
-fields on the shared WallInput: P/M/V, Pd override, uncracked fraction, joint
-demand, and OOP fields belong to the case/supplement. `calculate_wall(WallInput)`
+fields on the shared WallInput: P/M/V, the case Pd and its basis, the earthquake
+flag, uncracked fraction, joint demand, and OOP fields belong to the
+case/supplement. `calculate_wall(WallInput)`
 remains available with unchanged numerical behavior. Added engine metadata
 identifies check categories and selected/alternate curve methods.
