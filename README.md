@@ -5,25 +5,61 @@ Independent Streamlit design aid comparing CSA S304-14 and CSA S304:24 for recta
 ## Multiple load combinations
 
 Choose **Enter factored cases** for externally calculated concurrent P/M/V, or
-**Generate from unfactored actions** for signed D/L/S/W/E/Other contributions.
-Apply the input table to evaluate every enabled case for both editions. Selecting
-a case only changes the detailed checks and highlighted chart point.
+**Generate from unfactored actions** for signed D/L/S/W/E/H/Other contributions
+and the declared parts (D_partition, D_soil, L_roof, L_deck, S_deck, W_fixed,
+E_fixed). Apply the input table to evaluate every enabled case for both editions.
+Selecting a case only changes the detailed checks and highlighted chart point.
 
-The generator includes the OOP project's 14 editable reference formulas and
-automatically reverses complete W/E vectors, including axial load. Each factor
-applies to P, M, V and any supplied vertical head-joint demand. The 14 formulas
-produce 23 directional cases. They are a project reference set, not a complete
-NBCC specification; record and confirm the applicable project load basis.
+Generated mode offers three ULS sets. **NBC 2025 Table 4.1.3.2.-A** is the
+default and has no default conditions: declare the importance category,
+occupancy, roof live load, parking deck, dead-load parts and fixed parts of W
+and E in its conditions form before any row is generated. The set includes the
+companion-zero row of every principal load (4.1.3.2.(3)), 1.25D and 0.9D in
+cases 2 to 4, 1.5H in cases 2 to 4 only, and 1.0D + 1.0E in case 5 (no
+0.9D + E row); the ordinary conditions (one L, one S, no parts) give 21 formulas
+and 33 directional cases. The **legacy 14-row reference set** (23 cases) is
+labelled by its content and is not an NBC 2025 set; **custom factors** are
+entered by the user (magnitudes only). Crane loads are not generated: enter
+crane cases as direct factored cases. W/E vectors are reversed in full,
+including axial load; fixed parts never reverse. A non-zero contribution that
+no enabled row applies makes every generated case invalid.
 
 Generated self-weight is either added once to D or declared already included.
-Direct Pf is never increased automatically. Pd has its own dead-load basis,
-independent of the D factor in a combination. Case-specific overrides and linked
-OOP results must be reviewed again when their wall or source actions change.
+Direct Pf is never increased automatically. Each case's Pd = 0.9 D_cnt +
+min(0, N_lat - N_cb) + N_cb, where D_cnt is the permanent dead load plus the
+self-weight above the section (no partition allowance, soil only where it
+resists), N_lat the case's signed W/E axial load and N_cb its declared
+coupling-beam part; live and snow loads never enter Pd. Direct rows without
+N_lat leave sliding and the Pd-dependent shear routes INCOMPLETE. Case-specific
+overrides and linked OOP results must be reviewed again when their wall or
+source actions change.
+
+The **seismic declaration** (SFRS or not, SFRS wall type, shear-wall role,
+earthquake analysis basis) has no default. While it is missing, for an SFRS
+wall, and for every case with an earthquake factor (also after copying such a
+case to direct mode), a banner names S304-14 Clause 16 / S304:24 Clause 17:
+these provisions are not implemented, so the cases are a coverage gap and never
+read "CHECKS CLEAR". The NBC 4.1.8.1 simplified-procedure exemption is not
+offered in the UI because its eligibility test needs declared hazard values.
 
 The results identify separate governors for axial compression/tension, P–M,
 diagonal shear, sliding, and applicable stack-joint shear. Invalid/incomplete
-cases remain visible. An IP resistance pass is separate from outstanding
-detailing, connections and OOP checks, and is not a complete CSA compliance verdict.
+cases remain visible. The success message appears only when every case passes
+and no numeric code limit outside the resistance checks is blocked; otherwise a
+warning lists the blocked limits. An IP resistance pass is separate from
+outstanding detailing, connections and OOP checks, and is not a complete CSA
+compliance verdict.
+
+Sidebar inputs keep entered values when other inputs change: the developed
+bar count (blank = all bars) is never raised and is reduced to the bar count
+with a notice; the height above the checked section is kept when hw changes,
+follows hw only while it equals hw (base section), and is reduced to hw with a
+notice; the face-shell and clear-cell reference values follow the unit
+thickness only until edited. Declarations the engine needs (bond-beam end
+anchorage, bars per bond beam and their clear spacing, bond-beam courses above
+the section, joint-reinforcement f'gr in Type N mortar, distributed flexural
+reinforcement, grout type, lap length, S304:24 minimum face shell) start blank:
+blank means not declared and gives no credit.
 
 See the [load-case guide](docs/load-combinations.md) for worked examples, input
 conventions, second-order analysis, exports, and the Python batch API.
@@ -51,6 +87,10 @@ The current release intentionally excludes flanged walls, openings, coupled wall
 python -m pip install -r requirements.txt
 python -m streamlit run streamlit_app.py
 ```
+
+The app needs Streamlit 1.61.1 or later (pinned with pandas 2.3.3 and altair
+6.2.2 in `requirements.txt`); below that it stops with a message. The UI tests
+are skipped below 1.61.1.
 
 ## Verify
 

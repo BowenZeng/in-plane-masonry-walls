@@ -89,6 +89,28 @@ def result_rows(batch: BatchResult) -> list[dict[str, object]]:
     return rows
 
 
+def blocked_code_limits(batch: BatchResult) -> list[dict[str, object]]:
+    """Numeric code limits outside the resistance checks that are not met or not evaluated (F-126).
+
+    One row per edition, check and status, with the IDs of the cases where the
+    check is blocked. Review, diagnostic and information items are excluded:
+    they are listed in the checks table, not as code limits.
+    """
+    found: dict[tuple[str, str, str, str], list[str]] = {}
+    for member in batch.results:
+        if member.result is None:
+            continue
+        for check in member.result.checks:
+            if check.kind != "numeric" or check.category == "resistance" or check.level == "pass":
+                continue
+            key = (member.edition, check.title, check.clause, check_status(check))
+            ids = found.setdefault(key, [])
+            if member.case.case_id not in ids:
+                ids.append(member.case.case_id)
+    return [{"Edition": edition, "Check": title, "Clause": clause, "Status": status, "Case IDs": tuple(ids)}
+            for (edition, title, clause, status), ids in found.items()]
+
+
 def governing_rows(batch: BatchResult) -> list[dict[str, object]]:
     return [{"Edition": row.edition, "Check": row.check,
              "Governing case IDs": ", ".join(row.case_ids), "Utilization": row.utilization,

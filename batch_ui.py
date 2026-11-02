@@ -13,8 +13,93 @@ import batch_reporting as reports
 import in_plane_engine as engine
 import load_combinations as lc
 
+nbc = lc.nbc
+
 DIRECT = "Enter factored cases"
 GENERATED = "Generate from unfactored actions"
+UNDECLARED = "Not declared"
+
+# WP1: the ULS set of generated mode. The NBC 2025 rows exist only for the
+# declared conditions (no condition has a default); the legacy set is labelled
+# by its content; custom rows are the user's own.
+NBC_SET = "NBC 2025 Table 4.1.3.2.-A (declare the load conditions)"
+LEGACY_SET = "Legacy 14-row reference set (not NBC 2025)"
+CUSTOM_SET = "Custom factors"
+LOAD_SETS = (NBC_SET, LEGACY_SET, CUSTOM_SET)
+
+IMPORTANCE_OPTIONS = (UNDECLARED, *nbc.IMPORTANCE_ULS)
+OCCUPANCY_OPTIONS = {
+    UNDECLARED: None,
+    "Ordinary (companion L as tabulated)": "ordinary",
+    "Storage, equipment or service room (companion L + 0.5, 4.1.3.2.(7))": "storage_equipment_or_service_room",
+}
+ROOF_OPTIONS = {
+    UNDECLARED: None,
+    "No roof live load on this wall": "none",
+    "Roof live load included in L": "included_in_L",
+    "Roof live load entered separately as L_roof (4.1.5.5)": "separate",
+}
+DECK_OPTIONS = {
+    UNDECLARED: None,
+    "No parking deck": "none",
+    "Vehicle-accessible parking deck (L_deck and S_deck)": "vehicle_accessible",
+    "Long-term vehicle storage deck (L_deck and S_deck)": "long_term_storage",
+}
+DEAD_PART_OPTIONS = {
+    UNDECLARED: None,
+    "None: D only": frozenset(),
+    "Partition allowance D_partition": frozenset({"D_partition"}),
+    "Soil D_soil": frozenset({"D_soil"}),
+    "D_partition and D_soil": frozenset({"D_partition", "D_soil"}),
+}
+FIXED_PART_OPTIONS = {
+    UNDECLARED: None,
+    "None: W and E fully reversible": frozenset(),
+    "Fixed wind part W_fixed": frozenset({"W_fixed"}),
+    "Fixed earthquake part E_fixed": frozenset({"E_fixed"}),
+    "W_fixed and E_fixed": frozenset({"W_fixed", "E_fixed"}),
+}
+_CONDITION_FIELDS = (("importance", "importance category", None), ("occupancy", "occupancy", OCCUPANCY_OPTIONS),
+                     ("roof", "roof live load", ROOF_OPTIONS), ("deck", "parking deck", DECK_OPTIONS),
+                     ("dead_parts", "dead-load parts", DEAD_PART_OPTIONS),
+                     ("fixed_parts", "fixed parts of W and E", FIXED_PART_OPTIONS))
+
+# WP3: the seismic declaration of the wall (no default; register I-22).
+SEISMIC_SYSTEMS = {UNDECLARED: None, "Part of the SFRS (seismic force-resisting system)": True,
+                   "Not part of the SFRS": False}
+SFRS_TYPES = (UNDECLARED, "Conventional construction", "Moderately ductile", "Ductile", "Unreinforced", "Other")
+_ROLE_LABELS = {"loadbearing_shear_wall": "Loadbearing shear wall",
+                "non_loadbearing_shear_wall": "Non-loadbearing shear wall",
+                "infill_shear_wall": "Infill shear wall"}
+ROLE_OPTIONS = {UNDECLARED: None, **{_ROLE_LABELS.get(role, role): role for role in engine.WALL_ROLES}}
+ANALYSIS_BASES = {UNDECLARED: "undeclared",
+                  "NBC 4.1.8.2 to 4.1.8.23 analysis": "nbc_4_1_8_2_to_23",
+                  "NBC 4.1.8.1 simplified procedure": "nbc_4_1_8_1_simplified",
+                  "Imported earthquake actions": "imported"}
+
+_PD_RULE = ("Pd = 0.9 D_cnt + min(0, N_lat - N_cb) + N_cb in every row (register I-1): D_cnt is D plus the self-weight "
+            "above the section (plus soil only where it resists, never the partition allowance), N_lat the case's signed "
+            "factored W/E axial load and N_cb its declared coupling-beam part; live and snow loads never enter Pd.")
+_CRANE = "Crane loads (NBC Table 4.1.3.2.-B) are not generated (F-120): enter crane cases as direct factored cases."
+SET_CAPTIONS = {
+    NBC_SET: ("NBC 2025 Table 4.1.3.2.-A for the declared conditions. Every principal-load row also appears without its "
+              "companion load (companion-zero rows, 4.1.3.2.(3)), with 1.25D and 0.9D in cases 2 to 4; W and E rows are "
+              "checked in both senses (their fixed parts never reverse). Lateral earth pressure enters cases 2 to 4 at "
+              "1.5H, never reversed, and never case 1 or 5 (Note A-4.1.3.2.(4)); case 5 is 1.0D + 1.0E with no 0.9D + E "
+              f"row. {_PD_RULE} {_CRANE} Only ULS rows are generated here, so S and W are the ULS-specified NBC 2025 "
+              "loads (no 0.6 / I conversion)."),
+    LEGACY_SET: (f"{nbc.LEGACY_LABEL}. Not an NBC 2025 set: it has no companion-zero rows and no H factor. W and E rows "
+                 f"are checked in both senses. {_PD_RULE} {_CRANE}"),
+    CUSTOM_SET: ("Custom factors are magnitudes (negative factors are refused); W and E rows are checked in both senses "
+                 "and their fixed parts never reverse. Enter 0 for absent terms; a part column applies only where its "
+                 "factor is entered. Custom rows are not checked against NBC 2025: confirm the project basis. "
+                 f"{_PD_RULE} {_CRANE}"),
+}
+
+
+def _factor_rows(combinations) -> list[dict]:
+    return [{"Combination ID": c.combination_id, "Name": c.name, "Enabled": c.enabled,
+             **{key: c.factors.get(key, 0.0) for key in lc.LOAD_TYPES}} for c in combinations]
 
 
 def _initialize() -> None:
@@ -27,8 +112,18 @@ def _initialize() -> None:
         "contribution_rows": [{"Load": key, "P (kN)": 150.0 if key == "D" else 0.0,
                                "M (kN-m)": 0.0, "V (kN)": 0.0, "Joint V (kN)": None}
                               for key in lc.LOAD_TYPES],
-        "factor_rows": [{"Combination ID": c.combination_id, "Name": c.name,
-                         "Enabled": c.enabled, **c.factors} for c in lc.REFERENCE_COMBINATIONS],
+        # factor_rows mirrors the rows of the chosen set on every run (empty
+        # while the NBC 2025 conditions are undeclared); custom_factor_rows is
+        # the editable custom table.
+        "load_set_choice": NBC_SET, "factor_rows": [],
+        "custom_factor_rows": _factor_rows(lc.REFERENCE_COMBINATIONS),
+        "nbc_conditions": {"importance": UNDECLARED, "occupancy": UNDECLARED, "roof": UNDECLARED,
+                           "deck": UNDECLARED, "dead_parts": UNDECLARED, "fixed_parts": UNDECLARED,
+                           "soil_depth_m": None, "soil_resisting": False, "coupling_beam_axial": False},
+        "nbc_version": 0,
+        "seismic_declaration": {"system": UNDECLARED, "sfrs_type": UNDECLARED, "wall_role": UNDECLARED,
+                                "analysis_basis": UNDECLARED, "urm_permitted": False},
+        "seismic_version": 0,
         "generated_weight": lc.ADD_SELF_WEIGHT,
         "direct_supplements": {}, "generated_supplements": {}, "copied_origins": {},
     }
@@ -74,9 +169,119 @@ def _direct_editor() -> None:
             st.rerun()
 
 
-def _generated_editor() -> None:
+def _conditions() -> tuple[nbc.LoadConditions | None, list[str]]:
+    """The declared NBC 2025 conditions, or None with the declarations still missing."""
+    declared = st.session_state.nbc_conditions
+    missing = [label for key, label, _ in _CONDITION_FIELDS if declared[key] == UNDECLARED]
+    if missing:
+        return None, missing
+    parts = set(DEAD_PART_OPTIONS[declared["dead_parts"]]) | set(FIXED_PART_OPTIONS[declared["fixed_parts"]])
+    roof, deck = ROOF_OPTIONS[declared["roof"]], DECK_OPTIONS[declared["deck"]]
+    if roof == "separate":
+        parts.add("L_roof")
+    if deck != "none":
+        parts |= {"L_deck", "S_deck"}
+    soil = "D_soil" in parts
+    # Only ULS rows are generated here: S and W are the ULS-specified loads.
+    return nbc.LoadConditions(
+        importance_category=declared["importance"], uls_specified=True,
+        occupancy=OCCUPANCY_OPTIONS[declared["occupancy"]], roof_live_load=roof, parking_deck=deck,
+        parts=frozenset(parts), soil_depth_m=declared["soil_depth_m"] if soil else None,
+        soil_resisting=bool(declared["soil_resisting"]) and soil,
+        coupling_beam_axial=bool(declared["coupling_beam_axial"])), []
+
+
+def _chosen_set() -> tuple[tuple[lc.Combination, ...], nbc.LoadConditions | None, str, str]:
+    """(rows, conditions, set name, error) of the chosen ULS set."""
+    choice = st.session_state.load_set_choice
+    if choice == NBC_SET:
+        conditions, missing = _conditions()
+        if conditions is None:
+            return (), None, "NBC 2025", ("Declare the NBC 2025 load conditions before rows are generated "
+                                          f"(none has a default): {', '.join(missing)}.")
+        try:
+            return lc.NBC2025_COMBINATIONS(conditions), conditions, "NBC 2025", ""
+        except ValueError as error:
+            return (), conditions, "NBC 2025", str(error)
+    if choice == LEGACY_SET:
+        return lc.REFERENCE_COMBINATIONS, None, "legacy 14-row reference", ""
+    return lc.combinations_from_rows(st.session_state.custom_factor_rows), None, "custom", ""
+
+
+def _conditions_form() -> None:
+    declared = st.session_state.nbc_conditions
+    version = st.session_state.nbc_version
+
+    def pick(column, label, options, key, help_text):
+        options = list(options)
+        return column.selectbox(label, options, index=options.index(declared[key]),
+                                key=f"nbc_{key}_{version}", help=help_text)
+
+    with st.form("nbc_conditions_form"):
+        st.markdown("**NBC 2025 load conditions** - each changes the rows; none has a default.")
+        columns = st.columns(3)
+        importance = pick(columns[0], "Importance category", IMPORTANCE_OPTIONS, "importance",
+                          "NBC 2025 Table 4.1.2.1. Recorded with the rows; the ULS-specified S and W already include "
+                          "their importance factors.")
+        occupancy = pick(columns[1], "Occupancy of the area carrying L", OCCUPANCY_OPTIONS, "occupancy",
+                         "4.1.3.2.(7): storage, equipment and service rooms add 0.5 to the companion L factor.")
+        roof = pick(columns[2], "Roof live load", ROOF_OPTIONS, "roof",
+                    "4.1.5.5 / Note (6): a separately entered roof live load L_roof is not combined with snow.")
+        deck = pick(columns[0], "Parking deck", DECK_OPTIONS, "deck",
+                    "Note (6): deck snow S_deck and deck live load L_deck rows; enter both contributions.")
+        dead = pick(columns[1], "Dead-load parts", DEAD_PART_OPTIONS, "dead_parts",
+                    "4.1.4.1.(5)-(6), 4.1.3.2.(8): the partition allowance is never counteracting (0.9D rows and "
+                    "D_cnt exclude it); soil takes 1.5 (or the hs factor) in the 1.25D rows.")
+        fixed = pick(columns[2], "Fixed parts of W and E", FIXED_PART_OPTIONS, "fixed_parts",
+                     "Parts of W or E that do not reverse with the load (e.g. uplift): same factor as W / E, never "
+                     "reversed, signed in N_lat.")
+        soil_depth = columns[0].number_input(
+            "Soil depth hs (m), D_soil only", min_value=0.01, value=declared["soil_depth_m"], step=0.1,
+            key=f"nbc_soil_depth_{version}",
+            help="4.1.3.2.(8): factor max(1.25, 1 + 0.6/hs) for hs > 1.2 m. Blank = 1.5 on the soil load.")
+        soil_resisting = columns[1].checkbox(
+            "Soil is part of the load-resisting system", value=declared["soil_resisting"],
+            key=f"nbc_soil_resisting_{version}",
+            help="4.1.4.1.(6): only then does soil enter the 0.9D rows and D_cnt. Unchecked = no credit.")
+        coupling = columns[2].checkbox(
+            "E axial load is coupling-beam axial load", value=declared["coupling_beam_axial"],
+            key=f"nbc_coupling_{version}",
+            help="Only a declared coupling-beam axial load may add compression to Pd. Unchecked = no credit.")
+        if st.form_submit_button("Apply NBC 2025 load conditions"):
+            st.session_state.nbc_conditions = {
+                "importance": importance, "occupancy": occupancy, "roof": roof, "deck": deck,
+                "dead_parts": dead, "fixed_parts": fixed,
+                "soil_depth_m": None if soil_depth is None else float(soil_depth),
+                "soil_resisting": bool(soil_resisting), "coupling_beam_axial": bool(coupling)}
+            st.session_state.nbc_version += 1
+            st.rerun()
+
+
+def _copy_set_to_custom(rows: list[dict]) -> None:
+    st.session_state.custom_factor_rows = [dict(row) for row in rows]
+    st.session_state.load_set_choice = CUSTOM_SET
+    st.session_state.pop("load_set", None)  # the selectbox re-renders from the stored choice
+    st.session_state.generated_version += 1
+
+
+def _set_selector() -> None:
+    # The choice is stored outside the widget key so it survives direct mode,
+    # where the selectbox is not rendered.
+    st.session_state.load_set_choice = st.selectbox(
+        "ULS load-combination set", LOAD_SETS, index=LOAD_SETS.index(st.session_state.load_set_choice),
+        key="load_set", help="NBC 2025 rows need the declared conditions below; the legacy set is a reference only; "
+                             "custom rows are entered by you.")
+
+
+def _generated_editor(chosen) -> None:
+    combinations, _, _, error = chosen
+    choice = st.session_state.load_set_choice
     st.caption("Enter signed, unfactored P/M/V contributions at this section. Generation assumes linear superposition; "
-               "each W/E reversal reverses its entire vector, including axial load. Zero is an entered value; blank is missing.")
+               "each W/E reversal reverses its entire vector, including axial load. Zero is an entered value; blank is missing. "
+               "The parts (D_partition to E_fixed) apply only in rows that carry their factor; a non-zero contribution "
+               "that no enabled row applies is an error.")
+    if choice == NBC_SET:
+        _conditions_form()
     with st.form("generated_load_form"):
         weight = st.radio("Generated-mode self-weight", [lc.ADD_SELF_WEIGHT, lc.SELF_WEIGHT_INCLUDED],
                           index=0 if st.session_state.generated_weight == lc.ADD_SELF_WEIGHT else 1,
@@ -85,23 +290,37 @@ def _generated_editor() -> None:
                                        key=f"contribution_editor_{st.session_state.generated_version}",
                                        disabled=["Load"], hide_index=True, width="stretch",
                                        column_config=_action_columns())
-        st.markdown("**Reference formulas and custom factors**")
-        st.caption("These 14 OOP reference formulas are editable and are not an exhaustive or code-certified NBCC set. "
-                   "Confirm the project basis, edit/add formulas as needed, and explicitly enter 0 for absent terms.")
-        factors = st.data_editor(pd.DataFrame(st.session_state.factor_rows,
-                                              columns=["Combination ID", "Name", "Enabled", *lc.LOAD_TYPES]),
-                                 key=f"factor_editor_{st.session_state.generated_version}",
-                                 num_rows="dynamic", hide_index=True, width="stretch",
-                                 column_config={key: st.column_config.NumberColumn(min_value=0.0, required=True, default=0.0)
-                                                for key in lc.LOAD_TYPES} | {
-                                     "Combination ID": st.column_config.TextColumn(required=True),
-                                     "Enabled": st.column_config.CheckboxColumn(default=True)})
+        factors = None
+        if choice == CUSTOM_SET:
+            st.markdown("**Custom factors**")
+            st.caption(SET_CAPTIONS[CUSTOM_SET])
+            factors = st.data_editor(pd.DataFrame(st.session_state.custom_factor_rows,
+                                                  columns=["Combination ID", "Name", "Enabled", *lc.LOAD_TYPES]),
+                                     key=f"factor_editor_{st.session_state.generated_version}",
+                                     num_rows="dynamic", hide_index=True, width="stretch",
+                                     column_config={key: st.column_config.NumberColumn(min_value=0.0, required=True, default=0.0)
+                                                    for key in lc.LOAD_TYPES} | {
+                                         "Combination ID": st.column_config.TextColumn(required=True),
+                                         "Enabled": st.column_config.CheckboxColumn(default=True)})
         if st.form_submit_button("Apply unfactored actions and combinations"):
             st.session_state.contribution_rows = contributions.to_dict("records")
-            st.session_state.factor_rows = factors.to_dict("records")
+            if factors is not None:
+                st.session_state.custom_factor_rows = factors.to_dict("records")
             st.session_state.generated_weight = weight
             st.session_state.generated_version += 1
             st.rerun()
+    if choice != CUSTOM_SET:
+        st.markdown(f"**{choice}**")
+        st.caption(SET_CAPTIONS[choice])
+        if error:
+            st.error(error)
+        rows = _factor_rows(combinations)
+        if rows:
+            used = [key for key in lc.LOAD_TYPES if key in nbc.BASE_TYPES or any(row[key] for row in rows)]
+            st.dataframe(pd.DataFrame([{**{k: row[k] for k in ("Combination ID", "Name")}, **{k: row[k] for k in used},
+                                        "Tags": ", ".join(c.tags)} for row, c in zip(rows, combinations)]),
+                         hide_index=True, width="stretch", key="preset_factor_rows")
+        st.button("Copy these rows to custom factors", on_click=_copy_set_to_custom, args=(rows,), disabled=not rows)
 
 
 def _copy_generated(cases: tuple[lc.LoadCase, ...]) -> None:
@@ -112,26 +331,143 @@ def _copy_generated(cases: tuple[lc.LoadCase, ...]) -> None:
     st.session_state.load_mode = DIRECT
 
 
-def _load_cases(wall: engine.WallInput, mode: str, section: str, basis: str) -> tuple[lc.LoadCase, ...]:
+def _load_cases(wall: engine.WallInput, mode: str, section: str, basis: str, chosen) -> tuple[lc.LoadCase, ...]:
     if mode == DIRECT:
         cases = lc.factored_cases_from_rows(st.session_state.direct_rows, section=section, load_basis=basis)
         origins = st.session_state.copied_origins
+        # A direct row has no factors: a copied generated case keeps its
+        # earthquake flag from its origin so the seismic gate stays (WP3).
         return tuple(replace(c, provenance={**c.provenance, "copied_from": origins[c.case_id]},
-                             source="Direct factored case copied from generated actions")
+                             source="Direct factored case copied from generated actions",
+                             earthquake_case=bool(origins[c.case_id].get("earthquake_case")))
                      if c.case_id in origins else c for c in cases)
-    definitions = lc.combinations_from_rows(st.session_state.factor_rows)
+    definitions, conditions, set_name, error = chosen
+    if error:
+        return (lc.LoadCase("NBC 2025", "NBC 2025 rows not generated", lc.Action(), source="Generated input error",
+                            section=section, load_basis=basis, error=error),)
     try:
         contributions = lc.contributions_from_rows(st.session_state.contribution_rows)
+        unused = lc.unused_contributions(contributions, definitions, set_name)
+        if unused:  # F-006: a load that no enabled row applies is a configuration error
+            raise ValueError(" ".join(unused))
         weight = engine.wall_self_weight(wall)
         return lc.generate_load_cases(contributions, definitions, self_weight=weight,
                                       self_weight_treatment=st.session_state.generated_weight,
-                                      section=section, load_basis=basis)
+                                      section=section, load_basis=basis, conditions=conditions)
     except (engine.CalculationError, ValueError, TypeError) as error:
         return tuple(lc.LoadCase(c.combination_id, c.name, lc.Action(), enabled=c.enabled,
                                  source="Generated input error", section=section, load_basis=basis,
                                  factors=c.factors, error=str(error),
                                  provenance={"contributions": st.session_state.contribution_rows})
                      for c in definitions)
+
+
+def _seismic_form(wall: engine.WallInput) -> None:
+    declared = st.session_state.seismic_declaration
+    version = st.session_state.seismic_version
+
+    def pick(column, label, options, key, help_text):
+        options = list(options)
+        return column.selectbox(label, options, index=options.index(declared[key]),
+                                key=f"seismic_{key}_{version}", help=help_text)
+
+    with st.expander("Seismic declaration (S304-14 Clause 16 / S304:24 Clause 17)",
+                     expanded=declared["system"] == UNDECLARED or declared["wall_role"] == UNDECLARED):
+        with st.form("seismic_declaration_form"):
+            columns = st.columns(2)
+            system = pick(columns[0], "Seismic force-resisting system (SFRS)", SEISMIC_SYSTEMS, "system",
+                          "Whether this wall is part of the SFRS. Not declared: the Clause 16 / 17 gate is INCOMPLETE "
+                          "in every case; an SFRS wall is always a coverage gap (Clause 16 / 17 not implemented).")
+            sfrs_type = pick(columns[1], "SFRS wall type", SFRS_TYPES, "sfrs_type",
+                             "Required for an SFRS wall (conventional, moderately ductile, ductile, unreinforced); "
+                             "recorded with the cases. It does not remove the gate in this release.")
+            role = pick(columns[0], "Shear-wall role", ROLE_OPTIONS, "wall_role",
+                        "S304-14 10.12 / S304:24 11.12: infill shear walls are not evaluated (UNSUPPORTED). "
+                        "Not declared: the role item is INCOMPLETE.")
+            basis = pick(columns[1], "Earthquake analysis basis", ANALYSIS_BASES, "analysis_basis",
+                         "The NBC procedure that produced the E actions. The NBC 4.1.8.1 simplified-procedure "
+                         "exemption needs its eligibility test on declared hazard values (4.1.8.1.(2)), which this "
+                         "view does not perform, so no basis removes the gate here.")
+            urm = st.checkbox(
+                "Unreinforced shear walls permitted by the seismic data (unreinforced walls only)",
+                value=declared["urm_permitted"], key=f"seismic_urm_{version}",
+                disabled=wall.wall_type != "Unreinforced masonry",
+                help="S304-14 4.5.1 / 16.2.1; S304:24 5.5.1 / 17.2.1; NBC Table 4.1.8.9: confirm from the seismic "
+                     "category or hazard index and the building that URM shear walls are permitted. "
+                     "Unchecked = not confirmed (the review item stays open).")
+            if st.form_submit_button("Apply seismic declaration"):
+                st.session_state.seismic_declaration = {"system": system, "sfrs_type": sfrs_type, "wall_role": role,
+                                                        "analysis_basis": basis, "urm_permitted": bool(urm)}
+                st.session_state.seismic_version += 1
+                st.rerun()
+        if declared["system"] != UNDECLARED and SEISMIC_SYSTEMS[declared["system"]] and declared["sfrs_type"] == UNDECLARED:
+            st.error("Declare the SFRS wall type of this SFRS wall.")
+
+
+def _seismic_record() -> dict[str, object]:
+    declared = st.session_state.seismic_declaration
+    system = SEISMIC_SYSTEMS[declared["system"]]
+    return {"system": "undeclared" if system is None else "sfrs_wall" if system else "not_sfrs_component",
+            "sfrs_type": declared["sfrs_type"] if system else "not applicable",
+            "wall_role": ROLE_OPTIONS[declared["wall_role"]] or "undeclared",
+            "analysis_basis": ANALYSIS_BASES[declared["analysis_basis"]],
+            "urm_seismic_permitted": bool(declared["urm_permitted"])}
+
+
+def _seismic_wall(wall: engine.WallInput) -> engine.WallInput:
+    """The wall with its seismic declaration; earthquake_case stays with the case layer."""
+    declared = st.session_state.seismic_declaration
+    return replace(wall, sfrs_wall=SEISMIC_SYSTEMS[declared["system"]], wall_role=ROLE_OPTIONS[declared["wall_role"]],
+                   urm_seismic_permitted=bool(declared["urm_permitted"]) and wall.wall_type == "Unreinforced masonry")
+
+
+def _seismic_banner(container, wall: engine.WallInput, cases, batch: lc.BatchResult) -> None:
+    """Banner naming Clause 16 / 17 whenever the seismic gate is active (WP3)."""
+    earthquake = [c.case_id for c in cases if c.enabled and c.earthquake_case]
+    engine_gate = any(check.check_id == "ip.seismic_provisions_not_evaluated" and check.level != "pass"
+                      for member in batch.results if member.result is not None for check in member.result.checks)
+    if wall.sfrs_wall is False and not earthquake and not engine_gate:
+        return
+    record = _seismic_record()
+    reasons = []
+    if wall.sfrs_wall is None:
+        reasons.append("the SFRS declaration of the wall is missing")
+    elif wall.sfrs_wall:
+        sfrs_type = record["sfrs_type"]
+        reasons.append("the wall is declared part of the SFRS"
+                       + (f" ({sfrs_type.lower()})" if sfrs_type != UNDECLARED else " (type not declared)"))
+    if earthquake:
+        listed = ", ".join(earthquake[:6]) + (", ..." if len(earthquake) > 6 else "")
+        reasons.append(f"{len(earthquake)} enabled case(s) carry an earthquake factor ({listed})")
+    text = ("**Seismic provisions not evaluated: S304-14 Clause 16 / S304:24 Clause 17.** The seismic design provisions "
+            f"are not implemented, and {' and '.join(reasons) or 'the engine gate is active'}. The affected cases are a "
+            "coverage gap (UNSUPPORTED; INCOMPLETE while the SFRS declaration is missing) and never read "
+            "CHECKS CLEAR; no review record clears them (register I-22).")
+    if record["analysis_basis"] == "nbc_4_1_8_1_simplified":
+        text += (" The NBC 4.1.8.1 simplified procedure is declared, but its eligibility (4.1.8.1.(2)) is not tested in "
+                 "this view, so the gate stays.")
+    container.warning(text)
+
+
+def _status_message(batch: lc.BatchResult) -> None:
+    """F-126: success only when every case passes and no numeric code limit is blocked."""
+    limits = reports.blocked_code_limits(batch)
+    if batch.all_ip_pass and not limits:
+        st.success("All entered IP resistance cases pass.")
+        return
+    if not batch.results:
+        st.info("No enabled cases to evaluate.")
+        return
+    if batch.all_ip_pass:
+        text = "All entered IP resistance cases pass, but numeric code limits are not met or not evaluated"
+    else:
+        counts = Counter(r.resistance_status for r in batch.results)
+        text = "Case / edition evaluations: " + ", ".join(f"{n} {status}" for status, n in sorted(counts.items()))
+    if limits:
+        listed = "; ".join(f"{row['Check']} ({row['Edition']} {row['Clause']}: {row['Status']}, "
+                           f"{len(row['Case IDs'])} case(s))" for row in limits)
+        text += f". Blocked code limits: {listed}"
+    st.warning(text + ".")
 
 
 def _supplement_editor(wall: engine.WallInput, case: lc.LoadCase, storage_key: str) -> None:
@@ -257,18 +593,27 @@ def _selected_details(batch: lc.BatchResult, selected_id: str | None) -> None:
 def render_batch(wall: engine.WallInput) -> None:
     _initialize()
     st.subheader("Load cases at the checked section")
+    _seismic_form(wall)
+    wall = _seismic_wall(wall)
+    banner = st.container()
     mode = st.radio("Load entry mode", [DIRECT, GENERATED], key="load_mode", horizontal=True)
     section = st.text_input("Checked section / sliding plane identifier", value="Base", key="section_label")
     basis = st.text_input("Project load basis / analysis reference", value="Project basis to be confirmed", key="load_basis")
+    if mode == GENERATED:
+        _set_selector()
+    chosen = _chosen_set()
+    st.session_state.factor_rows = _factor_rows(chosen[0])
     if mode == DIRECT:
         _direct_editor()
     else:
-        _generated_editor()
-    cases = _load_cases(wall, mode, section, basis)
+        _generated_editor(chosen)
+    record = _seismic_record()
+    cases = tuple(replace(c, provenance={**c.provenance, "seismic_declaration": record})
+                  for c in _load_cases(wall, mode, section, basis, chosen))
     if mode == GENERATED:
         st.caption("If combination-specific second-order analysis is needed, copy these cases and enter final concurrent P/M/V in direct mode. "
-                   "Copying replaces the direct-mode table; generation provenance, D_cnt and the signed lateral axial "
-                  "loads are retained, so the copied cases keep their Pd.")
+                   "Copying replaces the direct-mode table; generation provenance, D_cnt, the signed lateral axial "
+                   "loads and the earthquake flag are retained, so the copied cases keep their Pd and seismic gate.")
         st.button("Copy generated cases to direct mode", on_click=_copy_generated, args=(cases,),
                   disabled=not cases or any(c.error for c in cases))
     # No case starts with an uncracked-area credit; it is entered per case (F-045).
@@ -282,14 +627,9 @@ def render_batch(wall: engine.WallInput) -> None:
         selected_id = st.selectbox("Case to inspect / review", list(selectable), key="inspected_case")
         _supplement_editor(wall, selectable[selected_id], storage_key)
     batch = lc.check_load_cases(wall, cases, st.session_state[storage_key])
+    _seismic_banner(banner, wall, cases, batch)
     st.subheader("All-case resistance results")
-    if batch.all_ip_pass:
-        st.success("All entered IP resistance cases pass.")
-    elif batch.results:
-        counts = Counter(r.resistance_status for r in batch.results)
-        st.warning("Case / edition evaluations: " + ", ".join(f"{n} {status}" for status, n in sorted(counts.items())))
-    else:
-        st.info("No enabled cases to evaluate.")
+    _status_message(batch)
     st.caption("IP resistance status covers the implemented section checks. Detailing, connections, OOP, analysis assumptions "
                "and project load-combination coverage must also be resolved; this is not a full CSA compliance verdict.")
     if batch.results:
