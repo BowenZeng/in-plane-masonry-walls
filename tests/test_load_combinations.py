@@ -166,6 +166,22 @@ class BatchTests(unittest.TestCase):
         self.assertTrue(all(r.resistance_status == "INVALID" for r in batch.results[2:]))
         self.assertFalse(batch.all_ip_pass)
 
+    def test_direct_rows_declare_the_earthquake_case(self):
+        # WP3: a direct row flagged as an earthquake case carries the seismic gate
+        # even on a wall declared outside the SFRS; copying keeps the flag.
+        wall = replace(self.wall, sfrs_wall=False, wall_role="loadbearing_shear_wall")
+        rows = [{"Case ID": "E1", "P (kN)": 200, "M (kN-m)": 50, "V (kN)": 20, lc.NLAT_COLUMN: 0, lc.EQ_COLUMN: True},
+                {"Case ID": "W1", "P (kN)": 200, "M (kN-m)": 50, "V (kN)": 20, lc.NLAT_COLUMN: 0}]
+        cases = lc.factored_cases_from_rows(rows, section="Base", load_basis="Analysis")
+        self.assertEqual([c.earthquake_case for c in cases], [True, False])
+        self.assertEqual([r[lc.EQ_COLUMN] for r in lc.direct_rows_from_cases(cases)], [True, False])
+        batch = lc.check_load_cases(wall, cases, editions=("S304:24",))
+        gate = {m.case.case_id: next((c for c in m.result.checks if c.check_id == "ip.seismic_provisions_not_evaluated"), None)
+                for m in batch.results}
+        self.assertEqual(gate["E1"].unresolved, "unsupported")
+        self.assertIsNone(gate["W1"])
+        self.assertEqual({m.case.case_id: m.additional_status for m in batch.results}["E1"], "OUTSTANDING")
+
     def test_malformed_editor_row_is_retained_and_blank_is_not_zero(self):
         rows = [{"Case ID": "bad", "P (kN)": "abc", "M (kN-m)": 0, "V (kN)": 0},
                 {"Case ID": "blank", "P (kN)": 0, "M (kN-m)": None, "V (kN)": 0},

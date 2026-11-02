@@ -27,6 +27,7 @@ EDITIONS = ("S304-14", "S304:24")
 DCNT_COLUMN = "Counteracting dead load D_cnt (kN)"
 NLAT_COLUMN = "Signed lateral axial in this case (kN)"
 NCB_COLUMN = "Coupling-beam axial in this case (kN)"
+EQ_COLUMN = "Earthquake case"
 ADD_SELF_WEIGHT = "Add calculated self-weight"
 SELF_WEIGHT_INCLUDED = "Already included in D"
 DIRECT_SELF_WEIGHT = "Entered Pf includes all factored actions; self-weight is not added"
@@ -524,7 +525,9 @@ def factored_cases_from_rows(rows: Sequence[Mapping[str, object]], *, section: s
                               enabled=row.get("Enabled") is not False,
                               section=section, load_basis=load_basis, dead_load_for_pd=dead,
                               provenance={"entered_row": dict(row)}, error=error,
-                              lateral_axial=lateral, coupling_axial=coupling))
+                              lateral_axial=lateral, coupling_axial=coupling,
+                              # The row's actions include earthquake load: the seismic gate applies (WP3).
+                              earthquake_case=row.get(EQ_COLUMN) is True))
     return tuple(cases)
 
 
@@ -568,5 +571,5 @@ def direct_rows_from_cases(cases: Sequence[LoadCase]) -> list[dict[str, object]]
     return [{"Case ID": c.case_id, "Name": c.name, "Enabled": c.enabled,
              "P (kN)": c.actions.p, "M (kN-m)": c.actions.m, "V (kN)": c.actions.v,
              "Joint V (kN)": c.actions.stack_v, DCNT_COLUMN: c.dead_load_for_pd,
-             NLAT_COLUMN: c.lateral_axial, NCB_COLUMN: c.coupling_axial}
+             NLAT_COLUMN: c.lateral_axial, NCB_COLUMN: c.coupling_axial, EQ_COLUMN: c.earthquake_case}
             for c in cases]

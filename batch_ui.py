@@ -108,7 +108,7 @@ def _initialize() -> None:
         "direct_rows": [{"Case ID": "CASE-1", "Name": "Original case", "Enabled": True,
                          "P (kN)": 200.0, "M (kN-m)": 1000.0, "V (kN)": 200.0,
                          "Joint V (kN)": None, lc.DCNT_COLUMN: None, lc.NLAT_COLUMN: None,
-                         lc.NCB_COLUMN: None}],
+                         lc.NCB_COLUMN: None, lc.EQ_COLUMN: False}],
         "contribution_rows": [{"Load": key, "P (kN)": 150.0 if key == "D" else 0.0,
                                "M (kN-m)": 0.0, "V (kN)": 0.0, "Joint V (kN)": None}
                               for key in lc.LOAD_TYPES],
@@ -147,16 +147,21 @@ def _action_columns() -> dict:
         lc.NCB_COLUMN: st.column_config.NumberColumn(
             lc.NCB_COLUMN, help="Part of the lateral axial load that is coupling-beam axial load; only this part may add "
             "compression to Pd. Blank = 0.", format="%.3f"),
+        lc.EQ_COLUMN: st.column_config.CheckboxColumn(
+            lc.EQ_COLUMN, help="Tick when this row's actions include earthquake load: the Clause 16 / 17 seismic gate "
+            "then applies even to a wall declared outside the SFRS.", default=False),
     }
 
 
 def _direct_editor() -> None:
     st.caption("Whole-wall concurrent actions, already factored, including applicable second-order effects. "
                "Compression is positive. M and V may be signed. Apply edits to check every enabled row.")
+    rows = pd.DataFrame(st.session_state.direct_rows,
+                        columns=["Case ID", "Name", "Enabled", "P (kN)", "M (kN-m)", "V (kN)", "Joint V (kN)",
+                                 lc.DCNT_COLUMN, lc.NLAT_COLUMN, lc.NCB_COLUMN, lc.EQ_COLUMN])
+    rows[lc.EQ_COLUMN] = rows[lc.EQ_COLUMN].eq(True)  # Rows without the flag are not earthquake cases.
     with st.form("direct_load_form"):
-        frame = st.data_editor(pd.DataFrame(st.session_state.direct_rows,
-                                            columns=["Case ID", "Name", "Enabled", "P (kN)", "M (kN-m)", "V (kN)",
-                                                     "Joint V (kN)", lc.DCNT_COLUMN, lc.NLAT_COLUMN, lc.NCB_COLUMN]),
+        frame = st.data_editor(rows,
                                key=f"direct_editor_{st.session_state.direct_version}",
                                num_rows="dynamic", hide_index=True, width="stretch",
                                column_config=_action_columns() | {
@@ -339,7 +344,7 @@ def _load_cases(wall: engine.WallInput, mode: str, section: str, basis: str, cho
         # earthquake flag from its origin so the seismic gate stays (WP3).
         return tuple(replace(c, provenance={**c.provenance, "copied_from": origins[c.case_id]},
                              source="Direct factored case copied from generated actions",
-                             earthquake_case=bool(origins[c.case_id].get("earthquake_case")))
+                             earthquake_case=c.earthquake_case or bool(origins[c.case_id].get("earthquake_case")))
                      if c.case_id in origins else c for c in cases)
     definitions, conditions, set_name, error = chosen
     if error:
