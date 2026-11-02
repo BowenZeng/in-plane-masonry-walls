@@ -1,25 +1,28 @@
 """Concurrent section actions and batch checks, independent of Streamlit.
 
-The presets are the OOP project's 14 reference formulas, not an exhaustive
-NBCC load specification. Each scalar factor applies to the whole action vector.
-Resistance equations remain in in_plane_engine.
+Load sets come from nbc_load_sets: the NBC 2025 Table 4.1.3.2.-A set for the
+declared conditions (NBC2025_COMBINATIONS) and the legacy 14-row reference set
+(REFERENCE_COMBINATIONS, not an NBC 2025 set). Each scalar factor applies to
+the whole action vector. Resistance equations remain in in_plane_engine.
 """
 from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from hashlib import sha256
-from itertools import product
 import json
 import math
 from typing import Mapping, Sequence
 
 if __package__:
     from . import in_plane_engine as engine
+    from . import nbc_load_sets as nbc
 else:
     import in_plane_engine as engine
+    import nbc_load_sets as nbc
 
-LOAD_TYPES = ("D", "L", "S", "W", "E", "Other")
+LOAD_TYPES = nbc.LOAD_TYPES
+BASE_TYPES = nbc.BASE_TYPES
 EDITIONS = ("S304-14", "S304:24")
 DCNT_COLUMN = "Counteracting dead load D_cnt (kN)"
 NLAT_COLUMN = "Signed lateral axial in this case (kN)"
@@ -44,29 +47,30 @@ class Combination:
     factors: Mapping[str, float]
     enabled: bool = True
     error: str = ""
+    tags: tuple[str, ...] = ()
 
 
-def _reference(number: int, name: str, d: float, l: float = 0.0,
-               s: float = 0.0, w: float = 0.0, e: float = 0.0) -> Combination:
-    return Combination(f"R{number:02}", name, dict(zip(LOAD_TYPES, (d, l, s, w, e, 0.0))))
+def _combination(row: nbc.FactorRow) -> Combination:
+    return Combination(row.row_id, row.name, {key: row.factors.get(key, 0.0) for key in LOAD_TYPES},
+                       tags=row.tags)
 
 
-REFERENCE_COMBINATIONS = (
-    _reference(1, "1.4D", 1.4),
-    _reference(2, "1.25D + 1.5L + 1.0S", 1.25, 1.5, 1.0),
-    _reference(3, "0.9D + 1.5L + 1.0S", 0.9, 1.5, 1.0),
-    _reference(4, "1.25D + 1.5L + 0.4W", 1.25, 1.5, w=0.4),
-    _reference(5, "0.9D + 1.5L + 0.4W", 0.9, 1.5, w=0.4),
-    _reference(6, "1.25D + 1.0L + 1.5S", 1.25, 1.0, 1.5),
-    _reference(7, "0.9D + 1.0L + 1.5S", 0.9, 1.0, 1.5),
-    _reference(8, "1.25D + 1.5S + 0.4W", 1.25, s=1.5, w=0.4),
-    _reference(9, "0.9D + 1.5S + 0.4W", 0.9, s=1.5, w=0.4),
-    _reference(10, "1.25D + 0.5L + 1.4W", 1.25, 0.5, w=1.4),
-    _reference(11, "0.9D + 0.5L + 1.4W", 0.9, 0.5, w=1.4),
-    _reference(12, "1.25D + 0.5S + 1.4W", 1.25, s=0.5, w=1.4),
-    _reference(13, "0.9D + 0.5S + 1.4W", 0.9, s=0.5, w=1.4),
-    _reference(14, "1.0D + 0.5L + 0.25S + 1.0E", 1.0, 0.5, 0.25, e=1.0),
-)
+# Legacy 14-row reference set, labelled by its content (nbc.LEGACY_LABEL).
+REFERENCE_COMBINATIONS = tuple(_combination(row) for row in nbc.LEGACY_REFERENCE_14)
+
+
+def NBC2025_COMBINATIONS(conditions: nbc.LoadConditions) -> tuple[Combination, ...]:  # noqa: N802
+    """NBC 2025 Table 4.1.3.2.-A rows for the declared conditions (21 for one L and one S)."""
+    return tuple(_combination(row) for row in nbc.uls_set(conditions))
+
+
+def unused_contributions(contributions: Mapping[str, "Action"], combinations: Sequence[Combination],
+                         set_name: str) -> list[str]:
+    """Non-zero contributions that no enabled combination applies (F-006)."""
+    nonzero = [key for key, action in contributions.items()
+               if any(getattr(action, c) for c in ("p", "m", "v")) or action.stack_v]
+    rows = [nbc.FactorRow(c.combination_id, c.name, c.factors, enabled=c.enabled) for c in combinations]
+    return nbc.unused_contribution_findings(nonzero, rows, set_name)
 
 
 @dataclass(frozen=True)
@@ -209,17 +213,23 @@ def generate_load_cases(
     self_weight: float = 0.0,
     self_weight_treatment: str = ADD_SELF_WEIGHT,
     section: str = "Base",
-    load_basis: str = "OOP 14-formula reference set; confirm project NBCC basis",
+    load_basis: str = "Legacy 14-row reference set (not NBC 2025); confirm project load basis",
     coupling_beam_axial: bool = False,
+    conditions: nbc.LoadConditions | None = None,
 ) -> tuple[LoadCase, ...]:
     """Combine signed linear actions; retain invalid formulas as visible cases.
 
     Omitted load types mean zero. A missing stack_v for any contributing load
     leaves the joint demand unknown (explicit zero is distinct from missing).
     Each case carries its Pd_case (case_pd): D_cnt is D plus the added
-    self-weight, N_lat the signed factored W and E axial loads of the case;
-    the E axial load counts as coupling-beam axial only when declared so.
+    self-weight (plus D_soil only where the soil resists, never the partition
+    allowance), N_lat the signed factored W and E axial loads of the case
+    including their fixed parts; the E axial load counts as coupling-beam
+    axial only when declared so (conditions.coupling_beam_axial or the flag).
+    The NBC 2025 rows need their conditions (an error otherwise).
     """
+    if conditions is not None:
+        coupling_beam_axial = coupling_beam_axial or conditions.coupling_beam_axial
     cases = []
     duplicate_ids = {key for key, count in Counter(c.combination_id for c in combinations if c.enabled).items() if count > 1}
     for definition in combinations:
@@ -229,7 +239,11 @@ def generate_load_cases(
             section=section, load_basis=load_basis, factors=dict(definition.factors),
             self_weight_treatment=self_weight_treatment,
             provenance={"contributions": {k: asdict(v) for k, v in contributions.items()},
-                        "calculated_self_weight_kN": self_weight},
+                        "calculated_self_weight_kN": self_weight, "row_tags": list(definition.tags),
+                        "load_set": ("NBC 2025 Table 4.1.3.2.-A" if "nbc2025" in definition.tags
+                                     else nbc.LEGACY_LABEL if "legacy reference" in definition.tags
+                                     else "custom factors"),
+                        "conditions": asdict(conditions) if conditions is not None else None},
         )
         try:
             if definition.error:
@@ -238,11 +252,18 @@ def generate_load_cases(
                 raise ValueError("Combination ID is required.")
             if definition.combination_id in duplicate_ids:
                 raise ValueError("Enabled combination IDs must be unique.")
+            if "nbc2025" in definition.tags and conditions is None:
+                raise ValueError("NBC 2025 rows need the declared load conditions.")
             unknown = (set(contributions) | set(definition.factors)) - set(LOAD_TYPES)
             if unknown:
                 raise ValueError(f"Unknown load types: {', '.join(sorted(unknown))}.")
-            for key, factor in definition.factors.items():
-                _finite(factor, f"{key} factor", nonnegative=True)
+            findings = nbc.factor_findings(definition.factors)
+            errors = [message for level, message in findings if level == "error"]
+            if errors:
+                raise ValueError(" ".join(errors))
+            warnings = tuple(message for level, message in findings if level == "warning")
+            if "D_soil" in contributions and contributions["D_soil"].p and conditions is None:
+                raise ValueError("A soil contribution needs the declared load conditions (soil_resisting).")
             _finite(self_weight, "Calculated self-weight", nonnegative=True)
             if self_weight_treatment not in (ADD_SELF_WEIGHT, SELF_WEIGHT_INCLUDED):
                 raise ValueError("Select an explicit self-weight treatment.")
@@ -254,11 +275,12 @@ def generate_load_cases(
                     _validate_action(actions[key], key)
             dead = actions["D"].p + (self_weight if self_weight_treatment == ADD_SELF_WEIGHT else 0.0)
             actions["D"] = replace(actions["D"], p=dead)
-            reversible = [key for key in ("W", "E") if definition.factors.get(key, 0.0)]
-            for signs in product((1, -1), repeat=len(reversible)):
-                directions = dict(zip(reversible, signs))
-                factors = {key: definition.factors.get(key, 0.0) * directions.get(key, 1)
-                           for key in LOAD_TYPES}
+            # Counteracting dead load: no partition allowance; soil only where it resists (4.1.4.1.(5)-(6)).
+            dead_counteracting = dead + (actions["D_soil"].p if conditions is not None and conditions.soil_resisting else 0.0)
+            for suffix, signed in nbc.expand_directions(definition.factors):
+                factors = {key: signed.get(key, 0.0) for key in LOAD_TYPES}
+                directions = {key: (1 if factors[key] > 0 else -1) for key in nbc.REVERSIBLE if factors[key]}
+                reversible = list(directions)
                 active = [key for key in LOAD_TYPES if factors[key] != 0.0]
                 summed = {component: sum(factors[key] * getattr(actions[key], component)
                                          for key in active) for component in ("p", "m", "v")}
@@ -267,17 +289,20 @@ def generate_load_cases(
                 action = Action(**summed, stack_v=stack)
                 _validate_action(action, "Combined action")
                 direction = ", ".join(f"{key}{'+' if directions[key] > 0 else '-'}" for key in reversible)
-                case_id = definition.combination_id + (f"[{direction}]" if direction else "")
-                lateral = sum(factors[key] * actions[key].p for key in ("W", "E") if factors[key])
+                case_id = definition.combination_id + suffix
+                lateral = sum(factors[key] * actions[key].p
+                              for key in ("W", "E", "W_fixed", "E_fixed") if factors[key])
                 coupling = factors["E"] * actions["E"].p if coupling_beam_axial and factors["E"] else 0.0
-                pd = case_pd(dead, lateral, coupling)
+                pd = case_pd(dead_counteracting, lateral, coupling)
                 cases.append(LoadCase(**{**context, "case_id": case_id, "factors": factors},
                                       actions=action,
                                       direction=direction or "No reversible term",
-                                      dead_load_for_pd=dead, lateral_axial=lateral,
+                                      dead_load_for_pd=dead_counteracting, lateral_axial=lateral,
                                       coupling_axial=coupling, pd_case=pd.value,
                                       pd_parts=pd.parts, pd_basis=pd.basis,
-                                      earthquake_case=bool(definition.factors.get("E", 0.0))))
+                                      earthquake_case=bool(definition.factors.get("E", 0.0)
+                                                           or definition.factors.get("E_fixed", 0.0)),
+                                      warnings=warnings))
         except (ValueError, TypeError, OverflowError) as error:
             cases.append(LoadCase(**context, actions=Action(math.nan, math.nan, math.nan), error=str(error)))
     return tuple(cases)
@@ -508,7 +533,10 @@ def combinations_from_rows(rows: Sequence[Mapping[str, object]]) -> tuple[Combin
     for row in rows:
         error = ""
         try:
-            factors = {key: _number(row.get(key), f"{key} factor") for key in LOAD_TYPES}
+            # Base types are required columns; parts are optional (blank = not used).
+            factors = {key: _number(row.get(key), f"{key} factor") for key in BASE_TYPES}
+            factors.update({key: _number(row.get(key), f"{key} factor", optional=True) or 0.0
+                            for key in nbc.PART_TYPES})
         except (ValueError, TypeError, OverflowError) as exc:
             factors, error = {}, str(exc)
         combinations.append(Combination(_text(row.get("Combination ID")), _text(row.get("Name")),
@@ -521,7 +549,7 @@ def contributions_from_rows(rows: Sequence[Mapping[str, object]]) -> dict[str, A
     for row in rows:
         key = _text(row.get("Load"))
         if key not in LOAD_TYPES or key in contributions:
-            raise ValueError("Each load type D, L, S, W, E, Other must appear once.")
+            raise ValueError(f"Each load type ({', '.join(LOAD_TYPES)}) may appear once.")
         try:
             contributions[key] = Action(*(_number(row.get(column), f"{key} {column}")
                                           for column in ("P (kN)", "M (kN-m)", "V (kN)")),
@@ -530,8 +558,8 @@ def contributions_from_rows(rows: Sequence[Mapping[str, object]]) -> dict[str, A
             # Only formulas that use this contribution are invalid. A malformed
             # wind row must not suppress a valid dead-only calculation.
             contributions[key] = Action(math.nan, math.nan, math.nan)
-    if set(contributions) != set(LOAD_TYPES):
-        raise ValueError("Supply all six load types; enter 0 for absent loads.")
+    if not set(BASE_TYPES) <= set(contributions):
+        raise ValueError(f"Supply the base load types {', '.join(BASE_TYPES)}; enter 0 for absent loads.")
     return contributions
 
 
