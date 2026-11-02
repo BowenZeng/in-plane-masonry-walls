@@ -110,7 +110,7 @@ def reference(wall):
     ratio = min(1, max(0.25, moment_nmm / (shear_n * dv))) if shear_n else 1.0
     av = wall.horizontal_reinforcement_area
     if wall.edition == "S304-14" or not reinforced:
-        vm = 0.16 * (2 - ratio) * (math.sqrt(fm) if wall.edition == "S304-14" else 1)
+        vm = 0.16 * (2 - ratio) * (math.sqrt(fm) if wall.edition == "S304-14" or wall.apply_proposed_8_10_2_3_correction else 1)
         masonry = 0.6 * (vm * thickness * dv + 0.25 * pd * 1000) * gamma
         steel = 0.6 * 0.85 * av * 400 * dv / 200 if reinforced else 0
         maximum = 0.4 * 0.6 * math.sqrt(fm) * thickness * dv * gamma
@@ -163,8 +163,9 @@ def main():
         )
         cap = reference(wall)[1]
         axial_loads = [0, 0.3 * cap, 0.9 * cap] + ([-272.0] if reinforced else [])
-        for axial, av in product(axial_loads, (0, 200) if reinforced else (0,)):
-            case = replace(wall, factored_axial=axial, horizontal_reinforcement_area=av, horizontal_reinforcement_type="Bond beam bars" if av else "None")
+        corrections = (False, True) if (not reinforced and edition == "S304:24") else (False,)
+        for axial, av, correction in product(axial_loads, (0, 200) if reinforced else (0,), corrections):
+            case = replace(wall, factored_axial=axial, horizontal_reinforcement_area=av, horizontal_reinforcement_type="Bond beam bars" if av else "None", apply_proposed_8_10_2_3_correction=correction)
             expected = reference(case)
             actual = calculate_wall(case)
             calculated = (actual.section.area, actual.axial_cap, actual.moment_resistance, actual.self_weight, actual.pd, actual.shear.resistance, actual.sliding.resistance)

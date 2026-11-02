@@ -115,6 +115,10 @@ class WallInput:
     horizontal_continuity_confirmed: bool = False
     horizontal_top_bar: bool = False
     shear_method: str = "Use lower of simplified and general"
+    # Printed April 2024 Clause 8.10.2.3 omits sqrt(f'm). The June 2025
+    # corrections list that clause but their wording has not been read here;
+    # the square-root form is a proposed correction, off by default.
+    apply_proposed_8_10_2_3_correction: bool = False
     grout_type: str = "Coarse"
     squat_shear_distribution_confirmed: bool = False
     stack_joint_area: float | None = None
@@ -246,6 +250,14 @@ class Check:
     title: str
     detail: str
     clause: str
+    category: str = "additional"
+    check_id: str = ""
+    kind: str = "numeric"
+    demand: float | None = None
+    limit: float | None = None
+    units: str = ""
+    comparison: str | None = None
+    tolerance: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -278,6 +290,8 @@ class WallResult:
     sliding_utilization: float | None
     checks: tuple[Check, ...]
     trace: tuple[TraceEntry, ...]
+    curve_method: str = "Discrete"
+    alternate_curve_method: str | None = None
 
 
 class CalculationError(ValueError):
@@ -580,6 +594,16 @@ def _ties_qualify(wall: WallInput) -> bool:
     )
 
 
+def ties_qualify(wall: WallInput) -> bool:
+    """Public tie-qualification result shared with the out-of-plane adapter.
+
+    Compression reinforcement is credited only when the tie size, spacing and
+    arrangement confirmation satisfy Clause 13.2 (S304-14 Clause 12.2).
+    """
+
+    return _ties_qualify(wall)
+
+
 def _axial_cap(wall: WallInput, section: SectionProperties) -> float:
     compression = sum(
         0.85 * PHI_M * s.fm * (s.x1 - s.x0) * s.effective_thickness
@@ -618,6 +642,11 @@ def _wall_self_weight(wall: WallInput, section: SectionProperties) -> float:
         )
         mass = unit_mass + grout_mass
     return mass * 9.81 / 1000.0
+
+
+def wall_self_weight(wall: WallInput) -> float:
+    """Physical wall weight above the checked section, in kN."""
+    return _wall_self_weight(wall, section_properties(wall, "Discrete"))
 
 
 def _pd(wall: WallInput, self_weight: float) -> float:
@@ -1063,9 +1092,15 @@ def _shear_result(
             / (PHI_S * horizontal_fy * lever),
         )
     else:
-        if wall.edition == "S304:24":
-            vm = 0.16 * (2.0 - ratio)  # Clause 8.10.2.3 omits sqrt(f'm).
-            method = "S304:24 unreinforced shear route"
+        if wall.edition == "S304:24" and wall.apply_proposed_8_10_2_3_correction:
+            vm = 0.16 * (2.0 - ratio) * math.sqrt(fm)
+            method = (
+                "S304:24 unreinforced shear route; proposed June 2025 correction to "
+                "8.10.2.3 with sqrt(f'm) restored, not verified against the corrected text"
+            )
+        elif wall.edition == "S304:24":
+            vm = 0.16 * (2.0 - ratio)  # Printed April 2024 Clause 8.10.2.3 omits sqrt(f'm).
+            method = "S304:24 unreinforced shear route; printed April 2024 8.10.2.3 without sqrt(f'm)"
         else:
             vm = 0.16 * (2.0 - ratio) * math.sqrt(fm)
             method = "S304-14 in-plane shear route"
@@ -1201,8 +1236,12 @@ def _checks(
 ) -> tuple[Check, ...]:
     checks: list[Check] = []
 
-    def add(ok: bool, title: str, detail: str, clause: str) -> None:
-        checks.append(Check("pass" if ok else "blocked", title, detail, clause))
+    def add(ok: bool, title: str, detail: str, clause: str, category: str = "additional",
+            *, check_id: str = "", kind: str = "numeric", demand: float | None = None,
+            limit: float | None = None, units: str = "", comparison: str | None = None,
+            tolerance: float = 0.0) -> None:
+        checks.append(Check("pass" if ok else "blocked", title, detail, clause, category,
+                            check_id, kind, demand, limit, units, comparison, tolerance))
 
     flex_prefix = ("7" if wall.edition == "S304-14" else "8") if wall.wall_type == "Unreinforced masonry" else ("10" if wall.edition == "S304-14" else "11")
     flex_clause = f"{flex_prefix}.2 / {flex_prefix}.4"
@@ -1212,6 +1251,14 @@ def _checks(
             "Maximum compression resistance",
             f"Pf = {wall.factored_axial:.2f} kN; Pr,max = {axial_cap:.2f} kN.",
             flex_clause,
+            "resistance",
+            check_id="ip.maximum_compression_resistance",
+            kind="numeric",
+            demand=wall.factored_axial,
+            limit=axial_cap,
+            units="kN",
+            comparison="<=",
+            tolerance=1e-8,
         )
     else:
         add(
@@ -1219,6 +1266,14 @@ def _checks(
             "Maximum axial-tension resistance",
             f"|Pf| = {-wall.factored_axial:.2f} kN; Tr,max = {tension_cap:.2f} kN.",
             flex_clause,
+            "resistance",
+            check_id="ip.maximum_axial_tension_resistance",
+            kind="numeric",
+            demand=-wall.factored_axial,
+            limit=tension_cap,
+            units="kN",
+            comparison="<=",
+            tolerance=1e-8,
         )
     add(
         moment_resistance is not None
@@ -1233,6 +1288,14 @@ def _checks(
             )
         ),
         flex_clause,
+        "resistance",
+        check_id="ip.axial_load_plus_in_plane_moment",
+        kind="numeric",
+        demand=wall.factored_moment,
+        limit=moment_resistance,
+        units="kNm",
+        comparison="<=",
+        tolerance=1e-8,
     )
     shear_clause = "7.10 / 10.10" if wall.edition == "S304-14" else "8.10 / 11.10"
     add(
@@ -1240,6 +1303,14 @@ def _checks(
         "Diagonal shear",
         f"Vf = {wall.factored_shear:.2f} kN; Vr = {shear.resistance:.2f} kN.",
         shear_clause,
+        "resistance",
+        check_id="ip.diagonal_shear",
+        kind="numeric",
+        demand=wall.factored_shear,
+        limit=shear.resistance,
+        units="kN",
+        comparison="<=",
+        tolerance=1e-8,
     )
     add(
         wall.factored_shear <= sliding.resistance + 1.0e-8,
@@ -1248,6 +1319,14 @@ def _checks(
         ("10.10.5.1" if wall.edition == "S304-14" else "11.10.5.1")
         if wall.wall_type != "Unreinforced masonry"
         else ("7.10.5.1" if wall.edition == "S304-14" else "8.10.5"),
+        "resistance",
+        check_id="ip.sliding_shear",
+        kind="numeric",
+        demand=wall.factored_shear,
+        limit=sliding.resistance,
+        units="kN",
+        comparison="<=",
+        tolerance=1e-8,
     )
 
     if wall.wall_type != "Unreinforced masonry":
@@ -1261,6 +1340,13 @@ def _checks(
             "Minimum vertical reinforcement",
             f"As,bar = {area:.1f} mm2; minimum = {minimum:.1f} mm2 at s = {section.bar_spacing:.1f} mm.",
             "10.15.1.1" if wall.edition == "S304-14" else "11.15.1.1",
+            check_id="ip.minimum_vertical_reinforcement",
+            kind="numeric",
+            demand=area,
+            limit=minimum,
+            units="mm2",
+            comparison=">=",
+            tolerance=1e-8,
         )
         ratio = area / (
             wall.thickness * min(section.bar_spacing, 4.0 * wall.thickness)
@@ -1270,30 +1356,65 @@ def _checks(
             "Maximum vertical reinforcement",
             f"Vertical steel ratio = {100.0 * ratio:.3f}%; limit = 2.000%.",
             "10.15.2" if wall.edition == "S304-14" else "11.15.2",
+            check_id="ip.maximum_vertical_reinforcement",
+            kind="numeric",
+            demand=ratio,
+            limit=0.02,
+            units="ratio",
+            comparison="<=",
+            tolerance=1e-12,
         )
         add(
             section.bar_spacing <= 2400.0 + 1.0e-8,
             "Maximum vertical-bar spacing",
             f"s_v = {section.bar_spacing:.1f} mm; limit = 2400 mm.",
             "10.15.1.2" if wall.edition == "S304-14" else "11.15.1.2",
+            check_id="ip.maximum_vertical_bar_spacing",
+            kind="numeric",
+            demand=section.bar_spacing,
+            limit=2400.0,
+            units="mm",
+            comparison="<=",
+            tolerance=1e-8,
         )
         add(
             wall.end_bar_distance <= 200.0 + 1.0e-8,
             "Vertical reinforcement at wall ends",
-            f"End-bar distance = {wall.end_bar_distance:.1f} mm; the supported end-cell limit is 200 mm.",
+            f"End-bar distance = {wall.end_bar_distance:.1f} mm; limit = 200 mm. The 200 mm end-cell limit is this model's interpretation of the end-of-wall requirement, not a value given by the standard.",
             "10.15.1.2" if wall.edition == "S304-14" else "11.15.1.2",
+            check_id="ip.vertical_reinforcement_at_wall_ends",
+            kind="numeric",
+            demand=wall.end_bar_distance,
+            limit=200.0,
+            units="mm",
+            comparison="<=",
+            tolerance=1e-8,
         )
         add(
             detailing.vertical_bar_diameter <= detailing.vertical_clearance_limit + 1.0e-8,
             "Vertical bar fit in masonry cell",
             f"Bar diameter = {detailing.vertical_bar_diameter:.1f} mm; limit = {detailing.vertical_clearance_limit:.1f} mm.",
             "12.1.3" if wall.edition == "S304-14" else "13.1.3",
+            check_id="ip.vertical_bar_fit_in_masonry_cell",
+            kind="numeric",
+            demand=detailing.vertical_bar_diameter,
+            limit=detailing.vertical_clearance_limit,
+            units="mm",
+            comparison="<=",
+            tolerance=1e-8,
         )
         add(
             wall.available_vertical_development >= detailing.vertical_development_required - 1.0e-8,
             "Vertical-bar development at critical section",
             f"Available = {wall.available_vertical_development:.0f} mm; required = {detailing.vertical_development_required:.0f} mm.",
             "12.4.2.3" if wall.edition == "S304-14" else "13.4.2.3",
+            check_id="ip.vertical_bar_development_at_critical_section",
+            kind="numeric",
+            demand=wall.available_vertical_development,
+            limit=detailing.vertical_development_required,
+            units="mm",
+            comparison=">=",
+            tolerance=1e-8,
         )
         if wall.splice_present and detailing.lap_required is not None:
             if wall.splice_class == "A":
@@ -1302,12 +1423,21 @@ def _checks(
                     "Class A splice eligibility",
                     "Requires at least twice the steel area required by analysis and no more than 50% spliced within the lap length.",
                     "12.5.4.1" if wall.edition == "S304-14" else "13.5.4.1 / Table 11",
+                    check_id="ip.class_a_splice_eligibility",
+                    kind="review",
                 )
             add(
                 wall.provided_lap_length >= detailing.lap_required - 1.0e-8,
                 f"Class {wall.splice_class} tension lap splice",
                 f"Provided = {wall.provided_lap_length:.0f} mm; required = {detailing.lap_required:.0f} mm.",
                 "12.5.4.2" if wall.edition == "S304-14" else "13.5.4.2",
+                check_id="ip.class_tension_lap_splice",
+                kind="numeric",
+                demand=wall.provided_lap_length,
+                limit=detailing.lap_required,
+                units="mm",
+                comparison=">=",
+                tolerance=1e-8,
             )
         add(
             wall.vertical_bars_continuous
@@ -1319,6 +1449,8 @@ def _checks(
                 else f"Available extension = {wall.available_termination_extension:.0f} mm; required = {detailing.termination_extension_required:.0f} mm."
             ),
             "12.4.8.3" if wall.edition == "S304-14" else "13.4.8.3",
+            check_id="ip.vertical_bar_continuity_or_termination_extension",
+            kind="numeric",
         )
         if wall.compression_reinforcement_tied:
             _, longitudinal_diameter = BAR_PROPERTIES[wall.bar_size]
@@ -1332,6 +1464,8 @@ def _checks(
                 "Compression-reinforcement ties",
                 f"Tie diameter = {wall.tie_diameter:.2f} mm (minimum 3.65); spacing = {wall.tie_spacing:.0f} mm (limit {tie_limit:.0f}); tie arrangement confirmed = {wall.tie_arrangement_confirmed}. Compression steel is credited only if all conditions pass.",
                 "12.2" if wall.edition == "S304-14" else "13.2",
+                check_id="ip.compression_reinforcement_ties",
+                kind="numeric",
             )
 
         if wall.horizontal_reinforcement_type == "Bond beam bars":
@@ -1348,6 +1482,13 @@ def _checks(
                 "Horizontal reinforcement area supplied",
                 f"Av = {wall.horizontal_reinforcement_area:.1f} mm2 at each level.",
                 "Reinforcement layout",
+                check_id="ip.horizontal_reinforcement_area_supplied",
+                kind="numeric",
+                demand=wall.horizontal_reinforcement_area,
+                limit=0.0,
+                units="mm2",
+                comparison=">",
+                tolerance=0.0,
             )
             horizontal_ratio = wall.horizontal_reinforcement_area / (
                 wall.thickness * min(wall.horizontal_reinforcement_spacing, 4.0 * wall.thickness)
@@ -1357,24 +1498,37 @@ def _checks(
                 "Maximum horizontal reinforcement",
                 f"Horizontal steel ratio = {100.0 * horizontal_ratio:.3f}%; limit = 2.000%.",
                 "10.15.2" if wall.edition == "S304-14" else "11.15.2",
+                check_id="ip.maximum_horizontal_reinforcement",
+                kind="numeric",
             )
             add(
                 wall.horizontal_reinforcement_spacing <= maximum_spacing + 1.0e-8,
                 "Horizontal shear-reinforcement spacing",
                 f"Type = {wall.horizontal_reinforcement_type}; s = {wall.horizontal_reinforcement_spacing:.1f} mm; limit = {maximum_spacing:.1f} mm.",
                 "10.15.1.4" if wall.edition == "S304-14" else "11.15.1.4",
+                check_id="ip.horizontal_shear_reinforcement_spacing",
+                kind="numeric",
+                demand=wall.horizontal_reinforcement_spacing,
+                limit=maximum_spacing,
+                units="mm",
+                comparison="<=",
+                tolerance=1e-8,
             )
             add(
                 wall.horizontal_anchorage_confirmed,
                 "Horizontal shear-reinforcement anchorage",
                 "Anchorage at both wall ends is confirmed." if wall.horizontal_anchorage_confirmed else "Horizontal steel is not credited until anchorage at both wall ends is confirmed.",
                 "12.4.11" if wall.edition == "S304-14" else "13.4.11",
+                check_id="ip.horizontal_shear_reinforcement_anchorage",
+                kind="review",
             )
             add(
                 wall.horizontal_continuity_confirmed,
                 "Horizontal reinforcement continuity",
                 "Continuity along the wall and at the top connection is confirmed." if wall.horizontal_continuity_confirmed else "Continuity along the wall and at the top connection has not been confirmed.",
                 "10.15.1.4" if wall.edition == "S304-14" else "11.15.1.4",
+                check_id="ip.horizontal_reinforcement_continuity",
+                kind="review",
             )
             if wall.horizontal_reinforcement_type == "Bond beam bars" and detailing.horizontal_development_required is not None:
                 add(
@@ -1383,18 +1537,39 @@ def _checks(
                     "Bond-beam bar fit in masonry space",
                     f"Bar diameter = {detailing.horizontal_bar_diameter:.1f} mm; limit = {detailing.vertical_clearance_limit:.1f} mm.",
                     "12.1.3" if wall.edition == "S304-14" else "13.1.3",
+                    check_id="ip.bond_beam_bar_fit_in_masonry_space",
+                    kind="numeric",
+                    demand=detailing.horizontal_bar_diameter,
+                    limit=detailing.vertical_clearance_limit,
+                    units="mm",
+                    comparison="<=",
+                    tolerance=1e-8,
                 )
                 add(
                     wall.horizontal_reinforcement_area >= BAR_AREAS[wall.horizontal_bar_size] - 1.0e-8,
                     "Bond-beam reinforcement area",
                     f"Provided Av = {wall.horizontal_reinforcement_area:.1f} mm2; one {wall.horizontal_bar_size} bar requires {BAR_AREAS[wall.horizontal_bar_size]:.1f} mm2.",
                     "Reinforcement layout",
+                    check_id="ip.bond_beam_reinforcement_area",
+                    kind="numeric",
+                    demand=wall.horizontal_reinforcement_area,
+                    limit=BAR_AREAS[wall.horizontal_bar_size],
+                    units="mm2",
+                    comparison=">=",
+                    tolerance=1e-8,
                 )
                 add(
                     wall.available_horizontal_development >= detailing.horizontal_development_required - 1.0e-8,
                     "Bond-beam-bar development",
                     f"Available = {wall.available_horizontal_development:.0f} mm; required = {detailing.horizontal_development_required:.0f} mm.",
                     "12.4.2.3" if wall.edition == "S304-14" else "13.4.2.3",
+                    check_id="ip.bond_beam_bar_development",
+                    kind="numeric",
+                    demand=wall.available_horizontal_development,
+                    limit=detailing.horizontal_development_required,
+                    units="mm",
+                    comparison=">=",
+                    tolerance=1e-8,
                 )
             if wall.horizontal_reinforcement_type == "Joint reinforcement":
                 joint_limit = min(5.0, wall.mortar_joint_thickness / 2.0)
@@ -1403,6 +1578,8 @@ def _checks(
                     "Joint-reinforcement wire diameter",
                     f"Diameter = {wall.joint_wire_diameter:.2f} mm; permitted range = 3.0 to {joint_limit:.2f} mm.",
                     "12.1.4" if wall.edition == "S304-14" else "13.1.4",
+                    check_id="ip.joint_reinforcement_wire_diameter",
+                    kind="numeric",
                 )
         elif shear.required_horizontal_area is not None and shear.required_horizontal_area > 1.0e-8:
             add(
@@ -1410,6 +1587,8 @@ def _checks(
                 "Required horizontal shear reinforcement",
                 f"Av = {shear.required_horizontal_area:.1f} mm2 is required at s = {wall.horizontal_reinforcement_spacing:.0f} mm, but no reinforcement type is selected.",
                 "10.10.2.1" if wall.edition == "S304-14" else "11.10.2.1",
+                check_id="ip.required_horizontal_shear_reinforcement",
+                kind="numeric",
             )
 
     if wall.wall_type == "Unreinforced masonry" and wall.horizontal_reinforcement_type != "None":
@@ -1420,7 +1599,9 @@ def _checks(
             unreinforced_horizontal_ratio <= 0.02 + 1.0e-12,
             "Maximum horizontal reinforcement",
             f"Horizontal steel ratio = {100.0 * unreinforced_horizontal_ratio:.3f}%; limit = 2.000%.",
-            "7.10.4" if wall.edition == "S304-14" else "8.10.4",
+            "10.15.1.3 / 10.15.1.4 applied by analogy" if wall.edition == "S304-14" else "11.15.1.3 / 11.15.1.4 applied by analogy",
+            check_id="ip.maximum_horizontal_reinforcement",
+            kind="numeric",
         )
         unreinforced_h_limit = (
             600.0
@@ -1435,13 +1616,22 @@ def _checks(
             wall.horizontal_reinforcement_spacing <= unreinforced_h_limit + 1.0e-8,
             "Horizontal reinforcement spacing",
             f"Type = {wall.horizontal_reinforcement_type}; s = {wall.horizontal_reinforcement_spacing:.1f} mm; limit = {unreinforced_h_limit:.1f} mm.",
-            "7.10.4" if wall.edition == "S304-14" else "8.10.4",
+            "10.15.1.3 / 10.15.1.4 applied by analogy" if wall.edition == "S304-14" else "11.15.1.3 / 11.15.1.4 applied by analogy",
+            check_id="ip.horizontal_reinforcement_spacing",
+            kind="numeric",
+            demand=wall.horizontal_reinforcement_spacing,
+            limit=unreinforced_h_limit,
+            units="mm",
+            comparison="<=",
+            tolerance=1e-8,
         )
         add(
             wall.horizontal_anchorage_confirmed and wall.horizontal_continuity_confirmed,
             "Horizontal reinforcement continuity and anchorage",
             "Continuity and anchorage are confirmed." if wall.horizontal_anchorage_confirmed and wall.horizontal_continuity_confirmed else "Confirm continuity and anchorage before relying on horizontal reinforcement.",
-            "7.10.4" if wall.edition == "S304-14" else "8.10.4",
+            "10.15.1.3 / 10.15.1.4 applied by analogy" if wall.edition == "S304-14" else "11.15.1.3 / 11.15.1.4 applied by analogy",
+            check_id="ip.horizontal_reinforcement_continuity_and_anchorage",
+            kind="review",
         )
         if wall.horizontal_reinforcement_type == "Bond beam bars" and detailing.horizontal_development_required is not None:
             add(
@@ -1450,12 +1640,26 @@ def _checks(
                 "Bond-beam bar fit in masonry space",
                 f"Bar diameter = {detailing.horizontal_bar_diameter:.1f} mm; limit = {detailing.vertical_clearance_limit:.1f} mm.",
                 "12.1.3" if wall.edition == "S304-14" else "13.1.3",
+                check_id="ip.bond_beam_bar_fit_in_masonry_space",
+                kind="numeric",
+                demand=detailing.horizontal_bar_diameter,
+                limit=detailing.vertical_clearance_limit,
+                units="mm",
+                comparison="<=",
+                tolerance=1e-8,
             )
             add(
                 wall.available_horizontal_development >= detailing.horizontal_development_required - 1.0e-8,
                 "Bond-beam-bar development",
                 f"Available = {wall.available_horizontal_development:.0f} mm; required = {detailing.horizontal_development_required:.0f} mm.",
                 "12.4.2.3" if wall.edition == "S304-14" else "13.4.2.3",
+                check_id="ip.bond_beam_bar_development",
+                kind="numeric",
+                demand=wall.available_horizontal_development,
+                limit=detailing.horizontal_development_required,
+                units="mm",
+                comparison=">=",
+                tolerance=1e-8,
             )
         if wall.horizontal_reinforcement_type == "Joint reinforcement":
             joint_limit = min(5.0, wall.mortar_joint_thickness / 2.0)
@@ -1464,6 +1668,8 @@ def _checks(
                 "Joint-reinforcement wire diameter",
                 f"Diameter = {wall.joint_wire_diameter:.2f} mm; permitted range = 3.0 to {joint_limit:.2f} mm.",
                 "12.1.4" if wall.edition == "S304-14" else "13.1.4",
+                check_id="ip.joint_reinforcement_wire_diameter",
+                kind="numeric",
             )
 
     if wall.bond_pattern == "Stack pattern":
@@ -1474,6 +1680,8 @@ def _checks(
             "Stack-pattern head-joint reinforcement",
             f"Continuous developed horizontal reinforcement is required; maximum spacing = {stack_spacing:.0f} mm.",
             "10.10.4" if wall.edition == "S304-14" else "11.10.4",
+            check_id="ip.stack_pattern_head_joint_reinforcement",
+            kind="numeric",
         )
         if wall.stack_joint_area is not None:
             maximum_crossing_area = wall.horizontal_reinforcement_area * (math.floor(wall.height / wall.horizontal_reinforcement_spacing) + 1)
@@ -1482,6 +1690,13 @@ def _checks(
                 "Stack-joint crossing area consistency",
                 f"Entered total = {wall.stack_joint_area:.1f} mm2; upper bound from wall height, Av and spacing = {maximum_crossing_area:.1f} mm2.",
                 "Reinforcement layout",
+                check_id="ip.stack_joint_crossing_area_consistency",
+                kind="numeric",
+                demand=wall.stack_joint_area,
+                limit=maximum_crossing_area,
+                units="mm2",
+                comparison="<=",
+                tolerance=1e-8,
             )
         add(
             wall.stack_vertical_shear is not None and wall.stack_joint_area is not None
@@ -1489,6 +1704,14 @@ def _checks(
             "Stack-pattern vertical joint shear",
             f"Vertical joint demand = {wall.stack_vertical_shear} kN; resistance = {shear.stack_vertical_resistance:.2f} kN. Enter the total area and vertical shear for the same assessed head-joint length.",
             "10.10.4" if wall.edition == "S304-14" else "11.10.4",
+            "resistance",
+            check_id="ip.stack_pattern_vertical_joint_shear",
+            kind="numeric",
+            demand=wall.stack_vertical_shear,
+            limit=shear.stack_vertical_resistance,
+            units="kN",
+            comparison="<=",
+            tolerance=1e-8,
         )
 
     if wall.wall_type == "Partially grouted reinforced masonry":
@@ -1497,6 +1720,8 @@ def _checks(
             "Partial-grout unit geometry",
             "Face-shell thickness, cell width, mortar-bedded area, and grout layout are confirmed." if wall.unit_geometry_confirmed else "Confirm face-shell thickness, cell width, mortar-bedded area, and grout layout.",
             "Table 4 Notes 2-3" if wall.edition == "S304-14" else "Table 4 Note 3",
+            check_id="ip.partial_grout_unit_geometry",
+            kind="review",
         )
 
     add(
@@ -1504,6 +1729,8 @@ def _checks(
         "Wall-to-foundation connection",
         "Base force transfer and reinforcement continuity are confirmed." if wall.base_connection_confirmed else "Confirm base force transfer, dowels, development, and foundation interface details.",
         "Wall-level connection",
+        check_id="ip.wall_to_foundation_connection",
+        kind="review",
     )
     if not wall.free_standing:
         add(
@@ -1511,12 +1738,17 @@ def _checks(
             "Wall-to-floor/roof connection",
             "Top lateral-load transfer and vertical continuity are confirmed." if wall.top_connection_confirmed else "Confirm top lateral-load transfer, anchorage, and vertical continuity.",
             "Wall-level connection",
+            check_id="ip.wall_to_floor_roof_connection",
+            kind="review",
         )
     add(
         stability.oop_check_provided,
         "Concurrent minor-axis/OOP check supplied",
         "OOP utilization is linked to this wall-level result." if stability.oop_check_provided else "Run the OOP wall tool for the same axial load and section, then enter its utilization.",
         "7.8 / 10.8" if wall.edition == "S304-14" else "8.8 / 11.8",
+        "external",
+        check_id="ip.concurrent_minor_axis_oop_check_supplied",
+        kind="diagnostic",
     )
     if stability.oop_check_provided:
         add(
@@ -1524,6 +1756,9 @@ def _checks(
             "Weak-axis slenderness and stability",
             "The linked OOP stability check passes." if stability.oop_stability_passed else "The linked OOP stability check does not pass.",
             "7.8 / 10.8" if wall.edition == "S304-14" else "8.8 / 11.8",
+            "external",
+            check_id="ip.weak_axis_slenderness_and_stability",
+            kind="diagnostic",
         )
         add(
             stability.combined_utilization is not None
@@ -1535,6 +1770,9 @@ def _checks(
                 else "No combined resistance is available at the entered axial load and moment."
             ),
             "Rational wall-level interaction screen",
+            "external",
+            check_id="ip.conservative_major_minor_interaction_screen",
+            kind="diagnostic",
         )
     checks.append(
         Check(
@@ -1543,6 +1781,8 @@ def _checks(
             f"Pd = {pd:.2f} kN; calculated wall self-weight = {self_weight:.2f} kN."
             + (" A direct Pd override is used." if wall.dead_load_compression is not None else " Pd = 0.9(D above + included wall self-weight)."),
             "7.10 / 10.10" if wall.edition == "S304-14" else "8.10 / 11.10",
+            check_id="ip.factored_dead_load_compression",
+            kind="info",
         )
     )
     checks.append(
@@ -1551,6 +1791,8 @@ def _checks(
             "Solid rectangular wall scope",
             "Flanged walls, openings, building-level load distribution, and seismic system classification are excluded by scope.",
             "Declared scope",
+            check_id="ip.solid_rectangular_wall_scope",
+            kind="info",
         )
     )
     return tuple(checks)
@@ -1594,11 +1836,15 @@ def calculate_wall(wall: WallInput) -> WallResult:
     moment_resistance = discrete_mr
     alternate_curve: tuple[InteractionPoint, ...] | None = None
     alternate_mr: float | None = None
+    curve_method = "Discrete"
+    alternate_curve_method = None
     if wall.wall_type == "Partially grouted reinforced masonry":
+        alternate_curve_method = "Smeared"
         smeared_section = section_properties(wall, "Smeared")
         smeared_curve, smeared_cap = interaction_curve(wall, smeared_section)
         smeared_mr = _moment_resistance_at_demand(wall, smeared_section)
         if wall.partial_grout_method == "Smeared":
+            curve_method, alternate_curve_method = "Smeared", "Discrete"
             section, curve, cap, moment_resistance = (
                 smeared_section,
                 smeared_curve,
@@ -1614,6 +1860,7 @@ def calculate_wall(wall: WallInput) -> WallResult:
             if discrete_mr is None or smeared_mr is None:
                 moment_resistance = None
             elif smeared_mr < discrete_mr:
+                curve_method, alternate_curve_method = "Smeared", "Discrete"
                 section, curve, moment_resistance = smeared_section, smeared_curve, smeared_mr
                 alternate_curve, alternate_mr = discrete_curve, discrete_mr
             else:
@@ -1697,6 +1944,8 @@ def calculate_wall(wall: WallInput) -> WallResult:
         sliding_utilization=sliding_utilization,
         checks=checks,
         trace=trace,
+        curve_method=curve_method,
+        alternate_curve_method=alternate_curve_method,
     )
 
 
@@ -1722,4 +1971,6 @@ __all__ = [
     "moment_at_axial_load",
     "section_point_at_c",
     "section_properties",
+    "ties_qualify",
+    "wall_self_weight",
 ]

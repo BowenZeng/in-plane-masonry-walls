@@ -2,211 +2,23 @@ from __future__ import annotations
 
 import importlib
 
-import altair as alt
-import pandas as pd
 import streamlit as st
 
 import in_plane_engine as engine
-
+import load_combinations
+import batch_reporting
+import batch_ui
 
 importlib.invalidate_caches()
 engine = importlib.reload(engine)
+load_combinations = importlib.reload(load_combinations)
+batch_reporting = importlib.reload(batch_reporting)
+batch_ui = importlib.reload(batch_ui)
 BAR_AREAS = engine.BAR_AREAS
-CalculationError = engine.CalculationError
 WallInput = engine.WallInput
-WallResult = engine.WallResult
-calculate_wall = engine.calculate_wall
 
-
-BUILD_MARKER = "2026-09-11.01"
+BUILD_MARKER = "2026-10-05.01"
 SOURCE_URL = "https://github.com/BowenZeng/in-plane-masonry-walls"
-
-
-def _fmt(value: float | None, digits: int = 2) -> str:
-    return "-" if value is None else f"{value:,.{digits}f}"
-
-
-def _status(result: WallResult) -> str:
-    blocked = sum(check.level == "blocked" for check in result.checks)
-    warnings = sum(check.level == "warning" for check in result.checks)
-    if blocked:
-        return f"{blocked} BLOCKED"
-    if warnings:
-        return "REVIEW REQUIRED"
-    return "PASS"
-
-
-def _summary(results: dict[str, WallResult]) -> pd.DataFrame:
-    rows = []
-    for edition, result in results.items():
-        rows.extend(
-            [
-                (edition, "Ungrouted f'm", result.section.fm_ungrouted, "MPa"),
-                (edition, "Grouted f'm", result.section.fm_grouted, "MPa"),
-                (edition, "Effective f'm", result.section.weighted_fm, "MPa"),
-                (edition, "Effective area Ae", result.section.area, "mm2"),
-                (edition, "Calculated wall self-weight", result.self_weight, "kN"),
-                (edition, "Shear dead-load compression Pd", result.pd, "kN"),
-                (edition, "Maximum axial resistance Pr,max", result.axial_cap, "kN"),
-                (edition, "Maximum axial-tension resistance", result.tension_cap, "kN"),
-                (edition, "Moment resistance Mr(Pf)", result.moment_resistance, "kN-m"),
-                (edition, "Alternate partial-grout Mr(Pf)", result.alternate_moment_resistance, "kN-m"),
-                (edition, "P-M utilization", result.pm_utilization, "-"),
-                (edition, "Diagonal shear resistance Vr", result.shear.resistance, "kN"),
-                (
-                    edition,
-                    "Diagonal shear utilization",
-                    engine.demand_utilization(result.wall.factored_shear, result.shear.resistance),
-                    "-",
-                ),
-                (edition, "Sliding shear resistance", result.sliding_resistance, "kN"),
-                (edition, "Sliding shear utilization", result.sliding_utilization, "-"),
-                (edition, "Stack-pattern vertical joint resistance", result.shear.stack_vertical_resistance, "kN"),
-                (edition, "Shear beta", result.shear.beta, "-"),
-                (edition, "Shear theta", result.shear.theta_degrees, "deg"),
-                (edition, "Required horizontal area", result.shear.required_horizontal_area, "mm2"),
-                (edition, "Required vertical development", result.detailing.vertical_development_required, "mm"),
-                (edition, "Combined in-plane plus OOP utilization", result.stability.combined_utilization, "-"),
-            ]
-        )
-    frame = pd.DataFrame(rows, columns=["Edition", "Quantity", "Value", "Unit"])
-    return frame
-
-
-def _comparison_table(results: dict[str, WallResult]) -> pd.DataFrame:
-    indexed = _summary(results).pivot(index=["Quantity", "Unit"], columns="Edition", values="Value")
-    for edition in ("S304-14", "S304:24"):
-        if edition not in indexed:
-            indexed[edition] = None
-    indexed = indexed[["S304-14", "S304:24"]]
-    indexed["Change"] = indexed["S304:24"] - indexed["S304-14"]
-    return indexed.reset_index()
-
-
-def _curve_frame(results: dict[str, WallResult]) -> pd.DataFrame:
-    rows: list[dict[str, object]] = []
-    for edition, result in results.items():
-        for curve_label, curve in (
-            ("Selected at entered Pf", result.curve),
-            ("Alternate", result.alternate_curve),
-        ):
-            if curve is None:
-                continue
-            for order, point in enumerate(curve):
-                rows.append(
-                    {
-                        "Edition": edition,
-                        "Curve": curve_label,
-                        "Order": order,
-                        "Branch": point.branch,
-                        "Moment resistance (kN-m)": point.m,
-                        "Axial resistance (kN)": point.p,
-                    }
-                )
-    return pd.DataFrame(rows)
-
-
-def _pm_chart(results: dict[str, WallResult]) -> alt.Chart:
-    curves = _curve_frame(results)
-    x_max = max(curves["Moment resistance (kN-m)"].max(), next(iter(results.values())).wall.factored_moment) * 1.05
-    y_max = max(curves["Axial resistance (kN)"].max(), next(iter(results.values())).wall.factored_axial) * 1.05
-    y_min = min(0.0, curves["Axial resistance (kN)"].min(), next(iter(results.values())).wall.factored_axial) * 1.05
-    demand = pd.DataFrame(
-        [
-            {
-                "Moment resistance (kN-m)": next(iter(results.values())).wall.factored_moment,
-                "Axial resistance (kN)": next(iter(results.values())).wall.factored_axial,
-                "Label": "Factored demand",
-            }
-        ]
-    )
-    lines = (
-        alt.Chart(curves)
-        .mark_line(strokeWidth=2.5)
-        .encode(
-            x=alt.X(
-                "Moment resistance (kN-m):Q",
-                title="Factored moment resistance (kN-m)",
-                scale=alt.Scale(domain=[0.0, max(x_max, 1.0)]),
-            ),
-            y=alt.Y(
-                "Axial resistance (kN):Q",
-                title="Factored axial resistance (kN)",
-                scale=alt.Scale(domain=[y_min, max(y_max, 1.0)]),
-            ),
-            color=alt.Color(
-                "Edition:N",
-                scale=alt.Scale(
-                    domain=["S304-14", "S304:24"],
-                    range=["#0b5cab", "#d97706"],
-                ),
-            ),
-            strokeDash=alt.StrokeDash(
-                "Curve:N",
-                scale=alt.Scale(domain=["Selected at entered Pf", "Alternate"], range=[[1, 0], [6, 4]]),
-            ),
-            order="Order:Q",
-            tooltip=[
-                "Edition:N",
-                "Branch:N",
-                alt.Tooltip("Moment resistance (kN-m):Q", format=",.1f"),
-                alt.Tooltip("Axial resistance (kN):Q", format=",.1f"),
-            ],
-        )
-    )
-    marker = (
-        alt.Chart(demand)
-        .mark_point(size=130, filled=True, color="#e11d48", shape="cross")
-        .encode(
-            x="Moment resistance (kN-m):Q",
-            y="Axial resistance (kN):Q",
-            tooltip=[
-                "Label:N",
-                alt.Tooltip("Moment resistance (kN-m):Q", format=",.1f"),
-                alt.Tooltip("Axial resistance (kN):Q", format=",.1f"),
-            ],
-        )
-    )
-    return (lines + marker).properties(height=500).interactive()
-
-
-def _check_frame(result: WallResult) -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {
-                "Status": check.level.upper(),
-                "Check": check.title,
-                "Result": check.detail,
-                "Clause": check.clause,
-            }
-            for check in result.checks
-        ]
-    )
-
-
-def _trace_frame(result: WallResult) -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {
-                "Variable": item.variable,
-                "Value": item.value,
-                "Unit": item.unit,
-                "Basis": item.equation,
-                "Clause": item.clause,
-            }
-            for item in result.trace
-        ]
-    )
-
-
-def _downloads(results: dict[str, WallResult]) -> tuple[bytes, bytes, bytes]:
-    summary = _summary(results).to_csv(index=False).encode("utf-8")
-    curves = _curve_frame(results).to_csv(index=False).encode("utf-8")
-    checks = pd.concat(
-        [frame.assign(Edition=edition) for edition, frame in ((e, _check_frame(r)) for e, r in results.items())],
-        ignore_index=True,
-    ).to_csv(index=False).encode("utf-8")
-    return summary, curves, checks
 
 
 def main() -> None:
@@ -320,22 +132,17 @@ def main() -> None:
         grout_type = st.selectbox("Grout type for general shear", ["Coarse", "Fine"])
         squat_distribution = st.checkbox("Squat-wall shear is distributed along the full length", value=False, disabled=height >= length, help="Required to use the increased 2014 shear cap, or the increased unreinforced 2024 shear cap.")
         stack_supplied = False
-        stack_area = stack_shear = 0.0
+        stack_area = 0.0
         if bond_pattern == "Stack pattern":
-            with st.expander("Vertical head-joint shear", expanded=True):
-                stack_supplied = st.checkbox("Head-joint demand and crossing reinforcement are supplied", value=False)
+            with st.expander("Vertical head-joint reinforcement", expanded=True):
+                stack_supplied = st.checkbox("Head-joint crossing reinforcement is supplied", value=False)
                 stack_area = st.number_input("Total developed area crossing assessed head joint (mm2)", min_value=0.0, value=0.0, step=100.0)
-                stack_shear = st.number_input("Factored vertical shear at assessed head joint (kN)", min_value=0.0, value=0.0, step=10.0, help="From wall-level shear-flow analysis over the same joint length as the entered reinforcement area; this is distinct from horizontal Vf.")
+                st.caption("Enter the concurrent vertical joint shear with each load case, or each unfactored contribution.")
 
-        st.header("Factored actions at checked section")
-        actions = st.columns(2)
-        pf = actions[0].number_input("Axial load Pf (kN; compression +)", value=200.0, step=10.0)
-        mf = actions[1].number_input("In-plane moment Mf (kN-m)", min_value=0.0, value=1000.0, step=50.0, help="Magnitude at the checked section, including applicable secondary effects from the wall analysis.")
-        vf = actions[0].number_input("In-plane shear Vf (kN)", min_value=0.0, value=200.0, step=10.0, help="Concurrent shear magnitude at the same section and load combination as Pf and Mf.")
-        dead_above = actions[1].number_input("Unfactored dead load above wall D (kN)", min_value=0.0, value=150.0, step=10.0)
+        st.header("Direct-case dead-load basis")
+        dead_above = st.number_input("Unfactored dead load above wall D (kN)", min_value=0.0, value=150.0, step=10.0)
         include_self_weight = st.checkbox("Include calculated wall self-weight in Pd = 0.9D", value=True)
-        override_pd = st.checkbox("Use direct factored Pd override", value=False)
-        pd_override = st.number_input("Direct factored Pd (kN)", min_value=0.0, value=150.0, step=10.0, disabled=not override_pd)
+        st.caption("Used only for direct cases without their own D-for-Pd value. Entered Pf is never increased automatically.")
 
         st.header("Sliding shear")
         sliding_surface = st.selectbox(
@@ -343,7 +150,7 @@ def main() -> None:
             ["Masonry / roughened concrete (mu = 1.0)", "Smooth concrete / bare steel (mu = 0.7)"],
         )
         sliding_plane = st.selectbox("Sliding plane", ["Base/support joint", "Between masonry courses"])
-        uncracked_fraction = st.number_input("Uncracked effective-area fraction Auc/Ae", min_value=0.0, max_value=1.0, value=0.5, step=0.05, disabled=sliding_plane != "Between masonry courses")
+        st.caption("Uncracked-area credit is entered and reviewed separately for each case.")
 
         with st.expander("Development, splices, and constructability"):
             in_situ_grout = st.number_input("In-situ grout strength f'gr (MPa)", min_value=1.0, value=20.0, step=1.0)
@@ -359,15 +166,9 @@ def main() -> None:
             termination_extension = st.number_input("Available extension past flexural cutoff (mm)", min_value=0.0, value=5000.0, step=100.0, disabled=bars_continuous)
             mortar_joint = st.number_input("Mortar-joint thickness (mm)", min_value=1.0, value=10.0, step=1.0)
 
-        with st.expander("Wall connections and OOP interface"):
+        with st.expander("Wall connections"):
             base_connection = st.checkbox("Wall-to-foundation force transfer confirmed", value=False)
             top_connection = st.checkbox("Wall-to-floor/roof force transfer confirmed", value=False, disabled=free_standing)
-            oop_provided = st.checkbox("Linked OOP wall result supplied", value=False)
-            oop_utilizations = {
-                edition: st.number_input(f"{edition} OOP utilization", min_value=0.0, value=0.0, step=0.05, disabled=not oop_provided)
-                for edition in ("S304-14", "S304:24")
-            }
-            oop_stability = st.checkbox("OOP weak-axis stability passes for both editions", value=False, disabled=not oop_provided)
 
         with st.expander("Self-weight material inputs"):
             masonry_density = st.number_input("Masonry material density (kg/m3)", min_value=1.0, value=2100.0, step=50.0)
@@ -410,11 +211,11 @@ def main() -> None:
         grout_type=grout_type,
         squat_shear_distribution_confirmed=bool(squat_distribution),
         stack_joint_area=float(stack_area) if stack_supplied else None,
-        stack_vertical_shear=float(stack_shear) if stack_supplied else None,
-        factored_axial=float(pf),
-        factored_moment=float(mf),
-        factored_shear=float(vf),
-        dead_load_compression=float(pd_override) if override_pd else None,
+        stack_vertical_shear=None,
+        factored_axial=0.0,
+        factored_moment=0.0,
+        factored_shear=0.0,
+        dead_load_compression=None,
         unfactored_dead_load_above=float(dead_above),
         include_wall_self_weight_in_pd=bool(include_self_weight),
         height_above_section=float(height_above),
@@ -423,7 +224,7 @@ def main() -> None:
         unit_solid_fraction=float(solid_fraction),
         sliding_friction=1.0 if "1.0" in sliding_surface else 0.7,
         sliding_plane=sliding_plane,
-        uncracked_area_fraction=float(uncracked_fraction),
+        uncracked_area_fraction=0.0,
         vertical_bars_developed_at_base=bool(developed and reinforced),
         developed_vertical_bar_count=developed_count if reinforced and developed else 0,
         in_situ_grout_strength=float(in_situ_grout),
@@ -441,77 +242,10 @@ def main() -> None:
         mortar_joint_thickness=float(mortar_joint),
         base_connection_confirmed=bool(base_connection),
         top_connection_confirmed=bool(top_connection),
-        oop_check_provided=bool(oop_provided),
-        oop_stability_passed=bool(oop_stability),
+        oop_check_provided=False,
+        oop_stability_passed=False,
     )
-    results: dict[str, WallResult] = {}
-    errors: list[str] = []
-    for edition in ("S304-14", "S304:24"):
-        try:
-            results[edition] = calculate_wall(WallInput(edition=edition, oop_utilization=float(oop_utilizations[edition]), **common))
-        except CalculationError as error:
-            errors.append(f"{edition}: {error}")
-    if errors:
-        for error in errors:
-            st.error(error)
-        st.stop()
-
-
-    st.subheader("P-M interaction")
-    st.altair_chart(_pm_chart(results), width="stretch")
-    st.caption(
-        "The cross marks the factored demand. Tied compression steel is credited only when selected and tie checks pass. For partial grouting, the alternate curve compares the discrete and smeared routes."
-    )
-
-    st.subheader("Edition comparison")
-    st.dataframe(
-        _comparison_table(results),
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "S304-14": st.column_config.NumberColumn(format="%.3f"),
-            "S304:24": st.column_config.NumberColumn(format="%.3f"),
-            "Change": st.column_config.NumberColumn(format="%+.3f"),
-        },
-    )
-
-    st.subheader("Section checks")
-    tabs = st.tabs(list(results))
-    for tab, (edition, result) in zip(tabs, results.items()):
-        with tab:
-            st.caption(_status(result))
-            st.dataframe(_check_frame(result), width="stretch", hide_index=True)
-            if result.shear.required_horizontal_area is not None:
-                st.caption(
-                    f"At s = {result.wall.horizontal_reinforcement_spacing:.0f} mm, the calculated area needed for Vf is {_fmt(result.shear.required_horizontal_area, 1)} mm2 before the maximum-shear cap."
-                )
-
-    with st.expander("Section model and reinforcement layout"):
-        model = results["S304-14"].section
-        rows = [
-            ("Effective area Ae", model.area, "mm2"),
-            ("Gross area Ag", model.gross_area, "mm2"),
-            ("Effective centroid", model.centroid, "mm from left end"),
-            ("Effective inertia", model.inertia, "mm4"),
-            ("Grouted fraction of Ae", model.grout_fraction, "-"),
-            ("Vertical bar spacing", model.bar_spacing, "mm"),
-        ]
-        st.dataframe(pd.DataFrame(rows, columns=["Quantity", "Value", "Unit"]), hide_index=True, width="stretch")
-        if model.bar_positions:
-            st.write("Vertical bar positions from the left end (mm):", ", ".join(_fmt(x, 1) for x in model.bar_positions))
-
-    with st.expander("Technical calculation trace"):
-        trace_tabs = st.tabs(list(results))
-        for tab, (edition, result) in zip(trace_tabs, results.items()):
-            with tab:
-                st.dataframe(_trace_frame(result), width="stretch", hide_index=True)
-
-    summary_csv, curves_csv, checks_csv = _downloads(results)
-    st.subheader("Export")
-    download_columns = st.columns(3)
-    download_columns[0].download_button("Download comparison CSV", summary_csv, "in_plane_wall_comparison.csv", "text/csv")
-    download_columns[1].download_button("Download P-M points CSV", curves_csv, "in_plane_wall_pm_points.csv", "text/csv")
-    download_columns[2].download_button("Download checks CSV", checks_csv, "in_plane_wall_checks.csv", "text/csv")
+    batch_ui.render_batch(WallInput(**common))
 
     st.caption(f"Build {BUILD_MARKER}")
 

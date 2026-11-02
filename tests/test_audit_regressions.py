@@ -4,7 +4,7 @@ from dataclasses import replace
 import math
 import unittest
 
-from in_plane_engine import CalculationError, WallInput, calculate_wall
+from in_plane_engine import CalculationError, WallInput, calculate_wall, ties_qualify
 
 
 class AuditRegressions(unittest.TestCase):
@@ -139,3 +139,33 @@ class AuditRegressions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OctoberReviewRegressions(unittest.TestCase):
+    """Regressions from the 21 October 2026 code-alignment review."""
+
+    def _unreinforced(self, **changes):
+        values = dict(edition="S304:24", wall_type="Unreinforced masonry", length=3000.0, height=3000.0, thickness=190.0,
+                      nominal_unit_strength=15.0, unreinforced_condition="Hollow ungrouted", face_shell_thickness=36.2,
+                      factored_axial=100.0, factored_moment=50.0, factored_shear=40.0, unfactored_dead_load_above=80.0,
+                      bar_count=0)
+        values.update(changes)
+        return WallInput(**values)
+
+    def test_printed_8_10_2_3_is_the_default_and_the_correction_is_opt_in(self):
+        printed = calculate_wall(self._unreinforced())
+        proposed = calculate_wall(self._unreinforced(apply_proposed_8_10_2_3_correction=True))
+        self.assertAlmostEqual(printed.shear.masonry_resistance, 29.8041, places=3)
+        self.assertAlmostEqual(proposed.shear.masonry_resistance, 90.6032, places=3)
+        self.assertIn("printed April 2024", printed.shear.method)
+        self.assertIn("proposed June 2025 correction", proposed.shear.method)
+        # The square root applies to vm only; the 0.25 Pd term is unchanged.
+        ratio = min(1.0, max(0.25, 50.0e6 / (40.0e3 * 2400.0)))
+        expected = 0.6 * (0.16 * (2.0 - ratio) * math.sqrt(12.0) * 190.0 * 2400.0 + 0.25 * printed.pd * 1000.0) * printed.section.gamma_g / 1000.0
+        self.assertAlmostEqual(proposed.shear.masonry_resistance, expected, places=6)
+        self.assertEqual(calculate_wall(self._unreinforced(edition="S304-14", apply_proposed_8_10_2_3_correction=True)).shear.method,
+                         calculate_wall(self._unreinforced(edition="S304-14")).shear.method)
+
+    def test_ties_qualify_is_public_and_matches_the_crediting_rule(self):
+        self.assertFalse(ties_qualify(WallInput(compression_reinforcement_tied=True)))
+        self.assertTrue(ties_qualify(WallInput(compression_reinforcement_tied=True, tie_arrangement_confirmed=True, tie_spacing=150.0)))
