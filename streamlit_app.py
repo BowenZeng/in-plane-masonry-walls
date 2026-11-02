@@ -139,10 +139,13 @@ def main() -> None:
                 stack_area = st.number_input("Total developed area crossing assessed head joint (mm2)", min_value=0.0, value=0.0, step=100.0)
                 st.caption("Enter the concurrent vertical joint shear with each load case, or each unfactored contribution.")
 
-        st.header("Direct-case dead-load basis")
-        dead_above = st.number_input("Unfactored dead load above wall D (kN)", min_value=0.0, value=150.0, step=10.0)
-        include_self_weight = st.checkbox("Include calculated wall self-weight in Pd = 0.9D", value=True)
-        st.caption("Used only for direct cases without their own D-for-Pd value. Entered Pf is never increased automatically.")
+        st.header("Direct-case counteracting dead load")
+        dead_above = st.number_input("Unfactored counteracting dead load above wall D_cnt (kN)", min_value=0.0, value=150.0, step=10.0,
+                                     help="Permanent dead load only: no partition allowance and no counteractive soil.")
+        include_self_weight = st.checkbox("Add the calculated wall self-weight to D_cnt", value=True)
+        st.caption("Used for direct cases without their own D_cnt. Each case's Pd = 0.9 D_cnt + min(0, N_lat - N_cb) + N_cb "
+                   "needs that case's signed lateral axial load N_lat (entered in the case table); without it sliding and "
+                   "the Pd-dependent shear routes are INCOMPLETE. Entered Pf is never increased automatically.")
 
         st.header("Sliding shear")
         sliding_surface = st.selectbox(

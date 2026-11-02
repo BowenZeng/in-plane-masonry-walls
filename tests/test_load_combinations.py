@@ -88,14 +88,20 @@ class CombinationTests(unittest.TestCase):
 class BatchTests(unittest.TestCase):
     def setUp(self):
         self.wall = engine.WallInput()
-        self.case = lc.LoadCase("C1", "Low demand", lc.Action(200, 50, 20))
+        # WP2: direct cases declare their signed lateral axial load (here none);
+        # Pd = 0.9 (D 150 kN + self-weight) from the wall's dead-load basis.
+        self.case = lc.LoadCase("C1", "Low demand", lc.Action(200, 50, 20), lateral_axial=0.0)
 
     def test_default_single_case_matches_existing_engine_in_both_editions(self):
         case = replace(self.case, actions=lc.Action(200, 1000, 200))
         supplement = lc.review_supplement(self.wall, case, lc.CaseSupplement(uncracked_area_fraction=.5))
         batch = lc.check_load_cases(self.wall, [case], {case.case_id: supplement})
+        weight = engine.wall_self_weight(self.wall)
         for member in batch.results:
-            expected = engine.calculate_wall(replace(self.wall, edition=member.edition))
+            self.assertAlmostEqual(member.result.pd, .9 * (150 + weight))
+            expected = engine.calculate_wall(replace(self.wall, edition=member.edition,
+                                                     dead_load_compression=member.result.pd,
+                                                     pd_basis=member.result.pd_basis))
             self.assertEqual(member.result, expected)
 
     def test_generated_direct_and_standalone_agree_and_signed_actions_survive(self):
@@ -106,9 +112,11 @@ class BatchTests(unittest.TestCase):
         direct_results = lc.check_load_cases(self.wall, direct).results
         for a, b in zip(gen_results, direct_results):
             self.assertEqual(a.result, b.result)
+            # WP2: Pd_case = 0.9 D_cnt + min(0, N_lat); W axial -10 kN x 1.4 in R10.
+            self.assertAlmostEqual(a.case.pd_case, .9 * a.case.dead_load_for_pd + min(0, a.case.lateral_axial))
             standalone = engine.calculate_wall(replace(self.wall, edition=a.edition,
                 factored_axial=a.case.actions.p, factored_moment=abs(a.case.actions.m), factored_shear=abs(a.case.actions.v),
-                unfactored_dead_load_above=a.case.dead_load_for_pd, include_wall_self_weight_in_pd=False,
+                dead_load_compression=a.case.pd_case, pd_basis=a.case.pd_basis,
                 uncracked_area_fraction=0))
             self.assertEqual(a.result, standalone)
         self.assertLess(generated[0].actions.m, 0)
@@ -119,7 +127,8 @@ class BatchTests(unittest.TestCase):
         self.assertAlmostEqual(result.pd, .9 * (150 + result.self_weight))
 
     def test_each_case_recomputes_demand_dependent_resistances(self):
-        cases = [self.case, replace(self.case, case_id="OTHER", actions=lc.Action(-100, 500, 150))]
+        # WP2: the uplift case declares its tensile lateral axial load, which reduces its Pd.
+        cases = [self.case, replace(self.case, case_id="OTHER", actions=lc.Action(-100, 500, 150), lateral_axial=-300.0)]
         batch = lc.check_load_cases(self.wall, cases)
         a, b = batch.results[1].result, batch.results[3].result
         self.assertNotEqual(a.moment_resistance, b.moment_resistance)
@@ -164,7 +173,8 @@ class BatchTests(unittest.TestCase):
 
     def test_zero_resistance_positive_demand_is_infinite_failure(self):
         wall = replace(self.wall, vertical_bars_developed_at_base=False)
-        case = replace(self.case, actions=lc.Action(-10, 0, 1))
+        # WP2: zero clamping comes from a case Pd below zero (uplift 300 kN > 0.9 D_cnt).
+        case = replace(self.case, actions=lc.Action(-10, 0, 1), lateral_axial=-300.0)
         batch = lc.check_load_cases(wall, [case])
         sliding = next(c for c in batch.results[0].resistance_checks if c.check == "Sliding")
         self.assertTrue(math.isinf(sliding.utilization))
@@ -200,7 +210,8 @@ class BatchTests(unittest.TestCase):
 
     def test_pd_override_and_uncracked_credit_are_case_specific_and_require_review(self):
         wall = replace(self.wall, sliding_plane="Between masonry courses")
-        supplement = lc.review_supplement(wall, self.case, lc.CaseSupplement(pd_override=10, uncracked_area_fraction=.75))
+        supplement = lc.review_supplement(wall, self.case, lc.CaseSupplement(pd_override=10, pd_override_source="Analysis X",
+                                                                             uncracked_area_fraction=.75))
         cases = [self.case, replace(self.case, case_id="OTHER")]
         members = lc.check_load_cases(wall, cases, {"C1": supplement}).results
         self.assertEqual(members[0].result.pd, 10)
@@ -214,7 +225,7 @@ class BatchTests(unittest.TestCase):
 
     def test_reordering_preserves_supplements_governors_and_fingerprints(self):
         second = replace(self.case, case_id="SECOND", actions=lc.Action(200, 400, 40))
-        sup = lc.review_supplement(self.wall, self.case, lc.CaseSupplement(pd_override=1))
+        sup = lc.review_supplement(self.wall, self.case, lc.CaseSupplement(pd_override=1, pd_override_source="Analysis X"))
         a = lc.check_load_cases(self.wall, [self.case, second], {"C1": sup})
         b = lc.check_load_cases(self.wall, [second, self.case], {"C1": sup})
         self.assertEqual(a.governing, b.governing)
@@ -231,7 +242,7 @@ class BatchTests(unittest.TestCase):
     def test_negative_dead_basis_requires_explicit_compressive_pd_override(self):
         case = replace(self.case, dead_load_for_pd=-1)
         self.assertEqual(lc.check_load_cases(self.wall, [case]).results[0].resistance_status, "INVALID")
-        sup = lc.review_supplement(self.wall, case, lc.CaseSupplement(pd_override=0))
+        sup = lc.review_supplement(self.wall, case, lc.CaseSupplement(pd_override=0, pd_override_source="Analysis X"))
         self.assertEqual(lc.check_load_cases(self.wall, [case], {case.case_id: sup}).results[0].result.pd, 0)
 
     def test_disabled_or_empty_batches_cannot_claim_all_cases_pass(self):

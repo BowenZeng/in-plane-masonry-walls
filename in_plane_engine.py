@@ -229,7 +229,13 @@ class WallInput:
     factored_axial: float = 200.0
     factored_moment: float = 1000.0
     factored_shear: float = 200.0
+    # Signed case Pd (kN) formed by the case layer: 0.9 D_cnt plus the signed
+    # lateral axial load of the case (load_combinations.case_pd). None leaves
+    # the Pd-dependent checks INCOMPLETE; there is no fallback (register I-2).
     dead_load_compression: float | None = None
+    pd_basis: str = ""
+    # Dead-load basis kept for the case layer's D_cnt (direct rows without
+    # their own value); the engine itself never forms Pd from it.
     unfactored_dead_load_above: float = 150.0
     include_wall_self_weight_in_pd: bool = True
     height_above_section: float | None = None
@@ -306,11 +312,11 @@ class ShearResult:
     moment_shear_ratio: float
     beta: float | None
     theta_degrees: float | None
-    masonry_resistance: float
+    masonry_resistance: float | None
     steel_resistance: float
-    uncapped_resistance: float
+    uncapped_resistance: float | None
     maximum_resistance: float
-    resistance: float
+    resistance: float | None
     required_horizontal_area: float | None
     minimum_horizontal_area_2024: float | None
     simplified_resistance: float | None
@@ -323,11 +329,11 @@ class ShearResult:
 
 @dataclass(frozen=True)
 class SlidingResult:
-    resistance: float
-    reinforced_route: float
+    resistance: float | None
+    reinforced_route: float | None
     bond_route: float | None
     uncracked_area: float
-    required_dowel_area: float
+    required_dowel_area: float | None
     developed_vertical_area: float
     method: str
 
@@ -392,8 +398,8 @@ class WallResult:
     detailing: DetailingResult
     stability: StabilityResult
     self_weight: float
-    pd: float
-    sliding_resistance: float
+    pd: float | None
+    sliding_resistance: float | None
     sliding_utilization: float | None
     checks: tuple[Check, ...]
     trace: tuple[TraceEntry, ...]
@@ -465,10 +471,8 @@ def _validate(wall: WallInput) -> None:
             raise CalculationError(f"{name.capitalize()} must be non-negative and finite.")
     if not math.isfinite(wall.factored_axial):
         raise CalculationError("Factored axial load must be finite.")
-    if wall.dead_load_compression is not None and (
-        not math.isfinite(wall.dead_load_compression) or wall.dead_load_compression < 0.0
-    ):
-        raise CalculationError("Factored dead-load compression override must be non-negative and finite.")
+    if wall.dead_load_compression is not None and not math.isfinite(wall.dead_load_compression):
+        raise CalculationError("Case Pd must be finite.")
     if wall.edition not in _FM_TABLE:
         raise CalculationError(f"Unsupported edition: {wall.edition}.")
     if wall.mortar_type not in ("Type S", "Type N"):
@@ -758,13 +762,17 @@ def wall_self_weight(wall: WallInput) -> float:
     return _wall_self_weight(wall, section_properties(wall, "Discrete"))
 
 
-def _pd(wall: WallInput, self_weight: float) -> float:
-    if wall.dead_load_compression is not None:
-        return wall.dead_load_compression
-    dead = wall.unfactored_dead_load_above
-    if wall.include_wall_self_weight_in_pd:
-        dead += self_weight
-    return 0.9 * dead
+PD_REQUIRED = ("case Pd required: 0.9 x counteracting dead load plus the signed lateral axial load of "
+               "this case (S304-14 2.3 / 10.10.2.1; S304:24 Clause 3); not supplied, so this check is "
+               "not evaluated (register I-2)")
+
+
+def _pd(wall: WallInput) -> tuple[float | None, bool, str]:
+    """(signed case Pd in kN or None, supplied, basis). No fallback: the engine
+    cannot know the case's lateral axial load (register I-2)."""
+    if wall.dead_load_compression is None:
+        return None, False, "not supplied"
+    return wall.dead_load_compression, True, wall.pd_basis or "supplied case Pd"
 
 
 def _development_length(
@@ -1068,7 +1076,7 @@ def moment_at_axial_load(
 def _shear_result(
     wall: WallInput,
     section: SectionProperties,
-    pd_kN: float,
+    pd_kN: float | None,
 ) -> ShearResult:
     dv = 0.8 * wall.length
     if wall.factored_shear > 0.0:
@@ -1080,7 +1088,9 @@ def _shear_result(
         ratio = 1.0
     fm = section.weighted_fm
     gamma = section.gamma_g
-    pd = pd_kN * 1000.0
+    # Only compression on the joint adds to Vm: 0.25 max(0, Pd). None when the
+    # case Pd is not supplied; the routes that need it then report no Vm.
+    pd_term = None if pd_kN is None else 0.25 * max(0.0, pd_kN) * 1000.0
     av = _horizontal_area_credited(wall, section)
     spacing = wall.horizontal_reinforcement_spacing
     horizontal_fy = wall.horizontal_fy
@@ -1120,8 +1130,10 @@ def _shear_result(
                 lever_value,
             )
 
+        pd_missing = False
         if section.grouted_length_fraction < 1.0 - 1.0e-8:
-            beta_simplified = beta_general = 0.16 * (2.0 - ratio) + 0.25 * pd / (
+            pd_missing = pd_term is None
+            beta_simplified = beta_general = 0.16 * (2.0 - ratio) + (pd_term or 0.0) / (
                 math.sqrt(fm) * wall.thickness * dv
             )
             theta_simplified = theta_general = 59.0
@@ -1200,6 +1212,11 @@ def _shear_result(
             * spacing
             / (PHI_S * horizontal_fy * lever),
         )
+        if pd_missing:
+            # The partially grouted beta has a Pd term: no Vm without the case Pd.
+            masonry = uncapped = resistance = required = None
+            beta = simplified_resistance = general_resistance = None
+            method += "; " + PD_REQUIRED
     else:
         if wall.edition == "S304:24" and wall.apply_proposed_8_10_2_3_correction:
             vm = 0.16 * (2.0 - ratio) * math.sqrt(fm)
@@ -1213,11 +1230,13 @@ def _shear_result(
         else:
             vm = 0.16 * (2.0 - ratio) * math.sqrt(fm)
             method = "S304-14 in-plane shear route"
-        masonry = PHI_M * (vm * wall.thickness * dv + 0.25 * pd) * gamma
+        masonry = None if pd_term is None else PHI_M * (vm * wall.thickness * dv + pd_term) * gamma
         steel = (
             0.60 * PHI_S * av * horizontal_fy * dv / spacing if reinforced else 0.0
         )
-        uncapped = masonry + steel
+        uncapped = None if masonry is None else masonry + steel
+        if masonry is None:
+            method += "; " + PD_REQUIRED
         aspect = min(1.0, max(0.5, wall.height / wall.length))
         squat_factor = (
             2.0 - aspect
@@ -1233,7 +1252,7 @@ def _shear_result(
             * gamma
             * squat_factor
         )
-        resistance = min(uncapped, maximum)
+        resistance = None if uncapped is None else min(uncapped, maximum)
         required = (
             max(
                 0.0,
@@ -1241,7 +1260,7 @@ def _shear_result(
                 * spacing
                 / (0.60 * PHI_S * horizontal_fy * dv),
             )
-            if reinforced
+            if reinforced and masonry is not None
             else None
         )
     stack_resistance = None
@@ -1257,11 +1276,11 @@ def _shear_result(
         moment_shear_ratio=ratio,
         beta=beta,
         theta_degrees=theta,
-        masonry_resistance=masonry / 1000.0,
+        masonry_resistance=None if masonry is None else masonry / 1000.0,
         steel_resistance=steel / 1000.0,
-        uncapped_resistance=uncapped / 1000.0,
+        uncapped_resistance=None if uncapped is None else uncapped / 1000.0,
         maximum_resistance=maximum / 1000.0,
-        resistance=resistance / 1000.0,
+        resistance=None if resistance is None else resistance / 1000.0,
         required_horizontal_area=required,
         minimum_horizontal_area_2024=minimum_av_2024,
         simplified_resistance=simplified_resistance,
@@ -1276,7 +1295,7 @@ def _shear_result(
 def _sliding_result(
     wall: WallInput,
     section: SectionProperties,
-    pd_kN: float,
+    pd_kN: float | None,
 ) -> SlidingResult:
     developed_count = 0
     if wall.wall_type != "Unreinforced masonry" and wall.vertical_bars_developed_at_base:
@@ -1289,25 +1308,37 @@ def _sliding_result(
     ld = _development_length(wall, section, horizontal=False) or 0.0
     if wall.available_vertical_development < ld:
         developed_area = 0.0
-    pd = pd_kN * 1000.0
-    # Under net uplift, equilibrium leaves only steel force minus uplift to
-    # clamp the joint; dead load cannot be counted a second time.
-    normal_force = wall.factored_axial * 1000.0 if wall.factored_axial < 0.0 else pd
-    clamping = max(0.0, normal_force + PHI_S * developed_area * wall.fy)
+    reinforced = wall.wall_type != "Unreinforced masonry"
     edition_factor = PHI_M if wall.edition == "S304-14" else 1.0
+    if wall.edition == "S304:24":
+        basis = (("Vr = mu C without phi_m, as printed in 11.10.5.1 (p.91)" if reinforced
+                  else "Vr = mu P without phi_m, as printed in 8.10.5 (p.58)") + " (register I-4)")
+    else:
+        basis = ("Vr = phi_m mu C (10.10.5.1)" if reinforced
+                 else "Vr = phi_m mu P1 (7.10.5.1), P1 read as Pd (register I-3)")
+    # The bond route's uncracked area keeps the sign of Pf: a joint under net
+    # tension has no uncracked bond area.
+    uncracked_area = wall.uncracked_area_fraction * section.area if wall.factored_axial >= 0.0 else 0.0
+    between_courses = wall.sliding_plane == "Between masonry courses"
+    method = ("greater of separate reinforced-friction and uncracked-bond routes" if between_courses
+              else "support-joint shear friction")
+    if pd_kN is None:
+        return SlidingResult(None, None, None, uncracked_area, None, developed_area,
+                             f"{method}; {PD_REQUIRED}")
+    # The clamping force is the case Pd (0.9 D_cnt plus the signed lateral
+    # axial load), never Pf: live and snow loads never clamp (register I-3).
+    pd = pd_kN * 1000.0
+    clamping = max(0.0, pd + PHI_S * developed_area * wall.fy)
     reinforced_route = edition_factor * wall.sliding_friction * clamping
-    uncracked_area = wall.uncracked_area_fraction * section.area if normal_force >= 0.0 else 0.0
     bond_route: float | None = None
-    if wall.sliding_plane == "Between masonry courses":
+    if between_courses:
         bond_route = (
             0.16 * PHI_M * math.sqrt(section.weighted_fm) * uncracked_area
-            + edition_factor * wall.sliding_friction * max(0.0, normal_force)
+            + edition_factor * wall.sliding_friction * max(0.0, pd)
         )
         resistance = max(reinforced_route, bond_route)
-        method = "greater of separate reinforced-friction and uncracked-bond routes"
     else:
         resistance = reinforced_route
-        method = "support-joint shear friction"
     required_area = 0.0
     if bond_route is None or bond_route < wall.factored_shear * 1000.0:
         required_area = max(
@@ -1315,7 +1346,7 @@ def _sliding_result(
             (
                 wall.factored_shear * 1000.0
                 / (edition_factor * wall.sliding_friction)
-                - normal_force
+                - pd
             )
             / (PHI_S * wall.fy),
         )
@@ -1326,7 +1357,7 @@ def _sliding_result(
         uncracked_area=uncracked_area,
         required_dowel_area=required_area,
         developed_vertical_area=developed_area,
-        method=method,
+        method=f"{method}; {basis}; C = max(0, Pd + phi_s As,dev fy)",
     )
 
 
@@ -1341,7 +1372,7 @@ def _checks(
     detailing: DetailingResult,
     stability: StabilityResult,
     self_weight: float,
-    pd: float,
+    pd: float | None,
 ) -> tuple[Check, ...]:
     checks: list[Check] = []
 
@@ -1416,9 +1447,10 @@ def _checks(
     )
     shear_clause = "7.10 / 10.10" if wall.edition == "S304-14" else "8.10 / 11.10"
     add(
-        wall.factored_shear <= shear.resistance + 1.0e-8,
+        shear.resistance is not None and wall.factored_shear <= shear.resistance + 1.0e-8,
         "Diagonal shear",
-        f"Vf = {wall.factored_shear:.2f} kN; Vr = {shear.resistance:.2f} kN.",
+        f"Vf = {wall.factored_shear:.2f} kN; "
+        + (f"Vr = {shear.resistance:.2f} kN." if shear.resistance is not None else f"Vr not evaluated: {PD_REQUIRED}."),
         shear_clause,
         "resistance",
         check_id="ip.diagonal_shear",
@@ -1428,11 +1460,14 @@ def _checks(
         units="kN",
         comparison="<=",
         tolerance=1e-8,
+        unresolved="incomplete" if shear.resistance is None else "",
     )
     add(
-        wall.factored_shear <= sliding.resistance + 1.0e-8,
+        sliding.resistance is not None and wall.factored_shear <= sliding.resistance + 1.0e-8,
         "Sliding shear",
-        f"Vf = {wall.factored_shear:.2f} kN; Vr,slide = {sliding.resistance:.2f} kN ({sliding.method}).",
+        f"Vf = {wall.factored_shear:.2f} kN; "
+        + (f"Vr,slide = {sliding.resistance:.2f} kN ({sliding.method})." if sliding.resistance is not None
+           else f"Vr,slide not evaluated ({sliding.method})."),
         ("10.10.5.1" if wall.edition == "S304-14" else "11.10.5.1")
         if wall.wall_type != "Unreinforced masonry"
         else ("7.10.5.1" if wall.edition == "S304-14" else "8.10.5"),
@@ -1444,6 +1479,7 @@ def _checks(
         units="kN",
         comparison="<=",
         tolerance=1e-8,
+        unresolved="incomplete" if sliding.resistance is None else "",
     )
 
     if wall.wall_type != "Unreinforced masonry":
@@ -1891,17 +1927,33 @@ def _checks(
             check_id="ip.conservative_major_minor_interaction_screen",
             kind="diagnostic",
         )
+    pd_basis = _pd(wall)[2]
     checks.append(
         Check(
             "pass",
             "Factored dead-load compression",
-            f"Pd = {pd:.2f} kN; calculated wall self-weight = {self_weight:.2f} kN."
-            + (" A direct Pd override is used." if wall.dead_load_compression is not None else " Pd = 0.9(D above + included wall self-weight)."),
+            (f"Pd = {pd:.2f} kN ({pd_basis}); dead-load factor {PD_DEAD_LOAD_FACTOR} in every combination "
+             "(S304-14 2.3 / 10.10.2.1; S304:24 Clause 3); NBC 2025 4.1.3.2.(5) 1.0D in load case 5 not "
+             f"applied (register I-1). Calculated wall self-weight = {self_weight:.2f} kN."
+             if pd is not None else
+             f"Pd not supplied: {PD_REQUIRED}. Calculated wall self-weight = {self_weight:.2f} kN."),
             "7.10 / 10.10" if wall.edition == "S304-14" else "8.10 / 11.10",
             check_id="ip.factored_dead_load_compression",
             kind="info",
         )
     )
+    if pd is not None and pd > wall.factored_axial + 1.0e-6:
+        checks.append(
+            Check(
+                "pass",
+                "Case Pd above Pf",
+                f"Pd = {pd:.2f} kN exceeds Pf = {wall.factored_axial:.2f} kN. Confirm that this case's "
+                "tensile lateral axial load is included in Pd; the composition cannot be checked from Pd alone.",
+                "7.10 / 10.10" if wall.edition == "S304-14" else "8.10 / 11.10",
+                check_id="ip.case_pd_above_pf",
+                kind="info",
+            )
+        )
     checks.append(
         Check(
             "pass",
@@ -1913,6 +1965,10 @@ def _checks(
         )
     )
     return tuple(checks)
+
+
+def _fmt(value: float | None, digits: int = 3) -> str:
+    return "-" if value is None else f"{value:.{digits}f}"
 
 
 def demand_utilization(demand: float, resistance: float | None) -> float | None:
@@ -1985,7 +2041,7 @@ def calculate_wall(wall: WallInput) -> WallResult:
     tension_cap = _tension_cap(wall, section)
     pm_utilization = demand_utilization(wall.factored_moment, moment_resistance)
     self_weight = _wall_self_weight(wall, physical_section)
-    pd = _pd(wall, self_weight)
+    pd, _, pd_basis = _pd(wall)
     shear = _shear_result(wall, physical_section, pd)
     sliding = _sliding_result(wall, physical_section, pd)
     detailing = _detailing_result(wall, physical_section)
@@ -2028,16 +2084,17 @@ def calculate_wall(wall: WallInput) -> WallResult:
         TraceEntry("Mr(Pf)", "-" if moment_resistance is None else f"{moment_resistance:.3f}", "kN-m", "elastic/cracked section envelope" if wall.wall_type == "Unreinforced masonry" else "strain-compatible P-M curve; reduced arm for squat walls", f"{flex_clause}.2"),
         TraceEntry("dv", f"{shear.effective_depth:.1f}", "mm", "0.8 lw", shear_clause),
         TraceEntry("M/(Vdv)", f"{shear.moment_shear_ratio:.4f}", "-", "limited to 0.25 through 1.0", shear_clause),
-        TraceEntry("Vm", f"{shear.masonry_resistance:.3f}", "kN", shear.method, shear_clause),
+        TraceEntry("Vm", _fmt(shear.masonry_resistance), "kN", shear.method, shear_clause),
         TraceEntry("Vs", f"{shear.steel_resistance:.3f}", "kN", shear.method, shear_clause),
-        TraceEntry("Vr", f"{shear.resistance:.3f}", "kN", "min(Vm + Vs, Vr,max)", shear_clause),
+        TraceEntry("Vr", _fmt(shear.resistance), "kN", "min(Vm + Vs, Vr,max)", shear_clause),
         TraceEntry("self-weight", f"{self_weight:.3f}", "kN", "unit material plus grout volume", "wall-level dead load"),
-        TraceEntry("Pd", f"{pd:.3f}", "kN", "0.9(D above + included wall self-weight), unless overridden", shear_clause),
+        TraceEntry("Pd", _fmt(pd), "kN", f"{pd_basis}; Pd_case = {PD_DEAD_LOAD_FACTOR} D_cnt + min(0, N_lat - N_cb) + N_cb, "
+                   "factor 0.9 in every combination (register I-1); Vm uses 0.25 max(0, Pd)", shear_clause),
         TraceEntry("beta", "-" if shear.beta is None else f"{shear.beta:.6f}", "-", shear.method, shear_clause),
         TraceEntry("theta", "-" if shear.theta_degrees is None else f"{shear.theta_degrees:.3f}", "deg", shear.method, shear_clause),
         TraceEntry("epsilon_x", "-" if shear.epsilon_x is None else f"{shear.epsilon_x:.7f}", "-", "S304:24 general shear method", shear_clause),
         TraceEntry("ze", "-" if shear.ze is None else f"{shear.ze:.3f}", "mm", "S304:24 general shear method", shear_clause),
-        TraceEntry("Vr,slide", f"{sliding.resistance:.3f}", "kN", sliding.method, shear_clause + ".5"),
+        TraceEntry("Vr,slide", _fmt(sliding.resistance), "kN", sliding.method, shear_clause + ".5"),
         TraceEntry("Vr,vertical joint", "-" if shear.stack_vertical_resistance is None else f"{shear.stack_vertical_resistance:.3f}", "kN", "stack-pattern vertical joint resistance; checked separately from horizontal Vf", shear_clause + ".4"),
         TraceEntry("vertical ld", f"{detailing.vertical_development_required:.3f}", "mm", "CSA straight deformed-bar development", "12.4.2.3" if wall.edition == "S304-14" else "13.4.2.3"),
     )
@@ -2063,6 +2120,7 @@ def calculate_wall(wall: WallInput) -> WallResult:
         trace=trace,
         curve_method=curve_method,
         alternate_curve_method=alternate_curve_method,
+        pd_basis=pd_basis,
     )
 
 

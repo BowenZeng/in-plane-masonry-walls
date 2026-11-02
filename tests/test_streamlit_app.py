@@ -17,10 +17,13 @@ def table(app, *columns):
     return next(item.value for item in app.dataframe if set(columns) <= set(item.value.columns))
 
 
-def case_row(case_id, p=200.0, m=50.0, v=20.0):
+def case_row(case_id, p=200.0, m=50.0, v=20.0, lateral=0.0):
+    # WP2: each direct case declares its signed lateral axial load (None = undeclared).
     return {"Case ID": case_id, "Name": case_id, "Enabled": True,
             "P (kN)": p, "M (kN-m)": m, "V (kN)": v,
-            "Joint V (kN)": None, "D for Pd (kN)": None}
+            "Joint V (kN)": None, "Counteracting dead load D_cnt (kN)": None,
+            "Signed lateral axial in this case (kN)": lateral,
+            "Coupling-beam axial in this case (kN)": None}
 
 
 @unittest.skipIf(AppTest is None, "Install requirements.txt to run UI checks")
@@ -143,8 +146,9 @@ class StreamlitRegressionTests(unittest.TestCase):
 
     def test_reordering_and_mode_switching_retain_case_inputs(self):
         self.set_cases([case_row("A"), case_row("B")])
-        control(self.app, "checkbox", "Use direct factored Pd override").set_value(True)
-        control(self.app, "number_input", "Direct factored Pd (kN)").set_value(99)
+        control(self.app, "checkbox", "Use a sourced case Pd instead of the case composition").set_value(True)
+        control(self.app, "number_input", "Signed case Pd (kN)").set_value(99)
+        control(self.app, "text_input", "Source of the case Pd").set_value("External analysis")
         control(self.app, "button", "Save and review case inputs").click()
         self.run_app()
         self.set_cases([case_row("B"), case_row("A")])

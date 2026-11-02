@@ -3,6 +3,11 @@
 Uses only WallInput/calculate_wall from production; material tables, integrations,
 equilibrium root solving and resistance equations are independently evaluated.
 The June 2025 errata are deliberately outside this audit's authorized basis.
+
+Pd follows the case rule (plan WP2): Pd_case = 0.9 D_cnt + min(0, N_lat), with
+D_cnt = 150 kN + the wall weight and N_lat the case's lateral axial load; in this
+matrix the tension in Pf is taken as the lateral uplift, N_lat = min(0, Pf). The
+reference forms that Pd itself and the engine receives it as the case Pd.
 """
 
 from dataclasses import replace
@@ -103,7 +108,7 @@ def reference(wall):
     volume = length * height * thickness / 1e9
     density = 2100 if not reinforced and wall.unreinforced_condition == "Solid units" else 0.56 * 2100 + 0.44 * filled_fraction * 2350
     weight = volume * density * 9.81 / 1000
-    pd = 0.9 * (150 + weight)
+    pd = 0.9 * (150 + weight) + min(0.0, wall.factored_axial)
     dv = 0.8 * length
     shear_n = wall.factored_shear * 1000
     moment_nmm = wall.factored_moment * 1e6
@@ -111,14 +116,14 @@ def reference(wall):
     av = wall.horizontal_reinforcement_area
     if wall.edition == "S304-14" or not reinforced:
         vm = 0.16 * (2 - ratio) * (math.sqrt(fm) if wall.edition == "S304-14" or wall.apply_proposed_8_10_2_3_correction else 1)
-        masonry = 0.6 * (vm * thickness * dv + 0.25 * pd * 1000) * gamma
+        masonry = 0.6 * (vm * thickness * dv + 0.25 * max(0.0, pd) * 1000) * gamma
         steel = 0.6 * 0.85 * av * 400 * dv / 200 if reinforced else 0
         maximum = 0.4 * 0.6 * math.sqrt(fm) * thickness * dv * gamma
         vr = min(masonry + steel, maximum) / 1000
     else:
         maximum = 0.25 * 0.6 * fm * thickness * dv * gamma
         if partial:
-            beta = 0.16 * (2 - ratio) + 0.25 * pd * 1000 / (math.sqrt(fm) * thickness * dv)
+            beta = 0.16 * (2 - ratio) + 0.25 * max(0.0, pd) * 1000 / (math.sqrt(fm) * thickness * dv)
             routes = [(beta, 59), (beta, 59)]
         else:
             minimum = 0.35 * thickness * 200 / 400
@@ -134,8 +139,8 @@ def reference(wall):
             vs = 0.85 * av * 400 * min(dv / math.tan(math.radians(angle)), height) / 200
             capacities.append(min(vm + vs, maximum) / 1000)
         vr = capacities[1] if wall.factored_axial < 0 or wall.shear_method == "General" else capacities[0] if wall.shear_method == "Simplified" else min(capacities)
-    normal = wall.factored_axial if wall.factored_axial < 0 else pd
-    slide = (0.6 if wall.edition == "S304-14" else 1) * max(0, normal + (340 if reinforced else 0))
+    # Clamping force C = max(0, Pd_case + phi_s As fy), never Pf (register I-3).
+    slide = (0.6 if wall.edition == "S304-14" else 1) * max(0, pd + (340 if reinforced else 0))
     return area, cap, mr, weight, pd, vr, slide
 
 
@@ -167,7 +172,7 @@ def main():
         for axial, av, correction in product(axial_loads, (0, 200) if reinforced else (0,), corrections):
             case = replace(wall, factored_axial=axial, horizontal_reinforcement_area=av, horizontal_reinforcement_type="Bond beam bars" if av else "None", apply_proposed_8_10_2_3_correction=correction)
             expected = reference(case)
-            actual = calculate_wall(case)
+            actual = calculate_wall(replace(case, dead_load_compression=expected[4], pd_basis="independent case rule"))
             calculated = (actual.section.area, actual.axial_cap, actual.moment_resistance, actual.self_weight, actual.pd, actual.shear.resistance, actual.sliding.resistance)
             for index, (got, want) in enumerate(zip(calculated, expected)):
                 tolerance = max(1e-7, abs(want) * 1e-10)

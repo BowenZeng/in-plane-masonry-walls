@@ -22,7 +22,8 @@ def _initialize() -> None:
         "load_mode": DIRECT, "direct_version": 0, "generated_version": 0,
         "direct_rows": [{"Case ID": "CASE-1", "Name": "Original case", "Enabled": True,
                          "P (kN)": 200.0, "M (kN-m)": 1000.0, "V (kN)": 200.0,
-                         "Joint V (kN)": None, "D for Pd (kN)": None}],
+                         "Joint V (kN)": None, lc.DCNT_COLUMN: None, lc.NLAT_COLUMN: None,
+                         lc.NCB_COLUMN: None}],
         "contribution_rows": [{"Load": key, "P (kN)": 150.0 if key == "D" else 0.0,
                                "M (kN-m)": 0.0, "V (kN)": 0.0, "Joint V (kN)": None}
                               for key in lc.LOAD_TYPES],
@@ -42,8 +43,16 @@ def _action_columns() -> dict:
             for key in ("P (kN)", "M (kN-m)", "V (kN)")} | {
         "Joint V (kN)": st.column_config.NumberColumn(
             "Joint V (kN)", help="Signed vertical head-joint shear, distinct from horizontal V. Blank means unknown.", format="%.3f"),
-        "D for Pd (kN)": st.column_config.NumberColumn(
-            "D for Pd (kN)", help="Optional total unfactored dead load INCLUDING self-weight. Blank uses sidebar D plus its self-weight setting.", format="%.3f"),
+        lc.DCNT_COLUMN: st.column_config.NumberColumn(
+            lc.DCNT_COLUMN, help="Unfactored counteracting dead load on the section INCLUDING the self-weight above it; "
+            "no partition allowance or counteractive soil. Blank uses the sidebar dead-load basis.", format="%.3f"),
+        lc.NLAT_COLUMN: st.column_config.NumberColumn(
+            lc.NLAT_COLUMN, help="Signed factored W/E axial load of this case (compression +, uplift -). Required for "
+            "Pd = 0.9 D_cnt + min(0, N_lat - N_cb) + N_cb; blank leaves sliding and the Pd-dependent shear INCOMPLETE.",
+            format="%.3f"),
+        lc.NCB_COLUMN: st.column_config.NumberColumn(
+            lc.NCB_COLUMN, help="Part of the lateral axial load that is coupling-beam axial load; only this part may add "
+            "compression to Pd. Blank = 0.", format="%.3f"),
     }
 
 
@@ -53,7 +62,7 @@ def _direct_editor() -> None:
     with st.form("direct_load_form"):
         frame = st.data_editor(pd.DataFrame(st.session_state.direct_rows,
                                             columns=["Case ID", "Name", "Enabled", "P (kN)", "M (kN-m)", "V (kN)",
-                                                     "Joint V (kN)", "D for Pd (kN)"]),
+                                                     "Joint V (kN)", lc.DCNT_COLUMN, lc.NLAT_COLUMN, lc.NCB_COLUMN]),
                                key=f"direct_editor_{st.session_state.direct_version}",
                                num_rows="dynamic", hide_index=True, width="stretch",
                                column_config=_action_columns() | {
@@ -137,9 +146,12 @@ def _supplement_editor(wall: engine.WallInput, case: lc.LoadCase, storage_key: s
         if previous.reviewed_for and previous.reviewed_for != fingerprint:
             st.warning("The wall or case has changed. These supplemental inputs are stale until reviewed.")
         with st.form(f"supplement_{storage_key}_{case.case_id}"):
-            override_pd = st.checkbox("Use direct factored Pd override", value=previous.pd_override is not None)
-            pd_value = st.number_input("Direct factored Pd (kN)", min_value=0.0,
-                                       value=float(previous.pd_override or 0.0), step=10.0)
+            override_pd = st.checkbox("Use a sourced case Pd instead of the case composition",
+                                      value=previous.pd_override is not None)
+            pd_value = st.number_input("Signed case Pd (kN)", value=float(previous.pd_override or 0.0), step=10.0,
+                                       help="0.9 x counteracting dead load plus this case's signed lateral axial load, "
+                                       "from an external analysis. Negative when uplift exceeds the dead load.")
+            pd_source = st.text_input("Source of the case Pd", value=previous.pd_override_source)
             fraction = st.number_input("Uncracked effective-area fraction Auc/Ae", min_value=0.0, max_value=1.0,
                                        value=float(previous.uncracked_area_fraction), step=0.05,
                                        help="New cases default to zero bond credit. Establish this fraction for the particular load case.")
@@ -161,7 +173,8 @@ def _supplement_editor(wall: engine.WallInput, case: lc.LoadCase, storage_key: s
                         oop[edition] = lc.LinkedOOP(utilization, stability, reference)
             if st.form_submit_button("Save and review case inputs"):
                 supplements[case.case_id] = lc.review_supplement(
-                    wall, case, lc.CaseSupplement(pd_value if override_pd else None, fraction,
+                    wall, case, lc.CaseSupplement(pd_value if override_pd else None,
+                                                  pd_source if override_pd else "", fraction,
                                                   stack if override_stack else None, oop))
                 st.rerun()
 
@@ -256,7 +269,8 @@ def render_batch(wall: engine.WallInput) -> None:
     cases = _load_cases(wall, mode, section, basis)
     if mode == GENERATED:
         st.caption("If combination-specific second-order analysis is needed, copy these cases and enter final concurrent P/M/V in direct mode. "
-                   "Copying replaces the direct-mode table; generation provenance and D-for-Pd values are retained.")
+                   "Copying replaces the direct-mode table; generation provenance, D_cnt and the signed lateral axial "
+                  "loads are retained, so the copied cases keep their Pd.")
         st.button("Copy generated cases to direct mode", on_click=_copy_generated, args=(cases,),
                   disabled=not cases or any(c.error for c in cases))
     storage_key = "direct_supplements" if mode == DIRECT else "generated_supplements"
@@ -296,7 +310,8 @@ def render_batch(wall: engine.WallInput) -> None:
         with st.expander("Case actions and combination provenance"):
             st.dataframe(frame[["Case ID", "Edition", "Section", "Load basis", "Source", "Factors", "Direction",
                                 "P (kN)", "Signed M (kN-m)", "Signed V (kN)", "Self-weight treatment",
-                                "Calculated self-weight (kN)", "D for Pd (kN)", "Pd (kN)", "Input fingerprint"]],
+                                "Calculated self-weight (kN)", "D_cnt (kN)", "N_lat (kN)", "Coupling axial (kN)",
+                                "Case Pd (kN)", "Pd (kN)", "Input fingerprint"]],
                          hide_index=True, width="stretch", key="case_provenance")
         st.subheader("Governing cases by check")
         st.dataframe(pd.DataFrame(reports.governing_rows(batch)), hide_index=True, width="stretch", key="governing_results")

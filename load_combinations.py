@@ -21,6 +21,9 @@ else:
 
 LOAD_TYPES = ("D", "L", "S", "W", "E", "Other")
 EDITIONS = ("S304-14", "S304:24")
+DCNT_COLUMN = "Counteracting dead load D_cnt (kN)"
+NLAT_COLUMN = "Signed lateral axial in this case (kN)"
+NCB_COLUMN = "Coupling-beam axial in this case (kN)"
 ADD_SELF_WEIGHT = "Add calculated self-weight"
 SELF_WEIGHT_INCLUDED = "Already included in D"
 DIRECT_SELF_WEIGHT = "Entered Pf includes all factored actions; self-weight is not added"
@@ -78,9 +81,21 @@ class LoadCase:
     factors: Mapping[str, float] = field(default_factory=dict)
     direction: str = "As entered"
     self_weight_treatment: str = DIRECT_SELF_WEIGHT
+    # Counteracting dead load D_cnt (kN, unfactored, including the self-weight
+    # above the section); blank in a direct row uses the wall's dead-load basis.
     dead_load_for_pd: float | None = None
     provenance: Mapping[str, object] = field(default_factory=dict)
     error: str = ""
+    # Signed factored W/E axial load of this case (kN, compression positive)
+    # and its declared coupling-beam part. None = not declared: the
+    # Pd-dependent checks are then INCOMPLETE (register I-2).
+    lateral_axial: float | None = None
+    coupling_axial: float = 0.0
+    pd_case: float | None = None
+    pd_parts: Mapping[str, float] = field(default_factory=dict)
+    pd_basis: str = ""
+    earthquake_case: bool = False
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -91,8 +106,17 @@ class LinkedOOP:
 
 
 @dataclass(frozen=True)
+class CasePd:
+    value: float
+    parts: Mapping[str, float]
+    basis: str
+
+
+@dataclass(frozen=True)
 class CaseSupplement:
+    # Signed case Pd from an external source; the source text is required.
     pd_override: float | None = None
+    pd_override_source: str = ""
     uncracked_area_fraction: float = 0.0
     stack_v: float | None = None
     oop: Mapping[str, LinkedOOP] = field(default_factory=dict)
@@ -156,6 +180,28 @@ def _validate_action(action: Action, label: str) -> None:
         _finite(action.stack_v, f"{label} vertical head-joint shear")
 
 
+def case_pd(dead_counteracting: float, lateral_axial: float, coupling_axial: float = 0.0, *,
+            factor: float = engine.PD_DEAD_LOAD_FACTOR, source: str = "case composition") -> CasePd:
+    """Pd_case = factor D_cnt + min(0, N_lat - N_cb) + N_cb, in kN (registers I-1, I-3).
+
+    D_cnt is the counteracting dead load on the section: permanent dead load
+    plus the self-weight above it, without a partition allowance or
+    counteractive soil. N_lat is the case's signed factored W/E axial load;
+    a tensile value always reduces Pd. N_cb is the part of N_lat declared
+    coupling-beam axial load, the only part that may add compression. Live
+    and snow loads never enter Pd. The factor is 0.9 in every combination.
+    """
+    _finite(dead_counteracting, "Counteracting dead load D_cnt", nonnegative=True)
+    _finite(lateral_axial, "Signed lateral axial load")
+    _finite(coupling_axial, "Coupling-beam axial load")
+    value = factor * dead_counteracting + min(0.0, lateral_axial - coupling_axial) + coupling_axial
+    parts = {"dead_counteracting_kN": dead_counteracting, "lateral_axial_kN": lateral_axial,
+             "coupling_beam_axial_kN": coupling_axial, "pd_factor": factor}
+    basis = (f"{source}: {factor:g} x D_cnt {dead_counteracting:.2f} + min(0, N_lat {lateral_axial:.2f} "
+             f"- N_cb {coupling_axial:.2f}) + N_cb = {value:.2f} kN")
+    return CasePd(value, parts, basis)
+
+
 def generate_load_cases(
     contributions: Mapping[str, Action],
     combinations: Sequence[Combination] = REFERENCE_COMBINATIONS,
@@ -164,11 +210,15 @@ def generate_load_cases(
     self_weight_treatment: str = ADD_SELF_WEIGHT,
     section: str = "Base",
     load_basis: str = "OOP 14-formula reference set; confirm project NBCC basis",
+    coupling_beam_axial: bool = False,
 ) -> tuple[LoadCase, ...]:
     """Combine signed linear actions; retain invalid formulas as visible cases.
 
     Omitted load types mean zero. A missing stack_v for any contributing load
     leaves the joint demand unknown (explicit zero is distinct from missing).
+    Each case carries its Pd_case (case_pd): D_cnt is D plus the added
+    self-weight, N_lat the signed factored W and E axial loads of the case;
+    the E axial load counts as coupling-beam axial only when declared so.
     """
     cases = []
     duplicate_ids = {key for key, count in Counter(c.combination_id for c in combinations if c.enabled).items() if count > 1}
@@ -218,10 +268,16 @@ def generate_load_cases(
                 _validate_action(action, "Combined action")
                 direction = ", ".join(f"{key}{'+' if directions[key] > 0 else '-'}" for key in reversible)
                 case_id = definition.combination_id + (f"[{direction}]" if direction else "")
+                lateral = sum(factors[key] * actions[key].p for key in ("W", "E") if factors[key])
+                coupling = factors["E"] * actions["E"].p if coupling_beam_axial and factors["E"] else 0.0
+                pd = case_pd(dead, lateral, coupling)
                 cases.append(LoadCase(**{**context, "case_id": case_id, "factors": factors},
                                       actions=action,
                                       direction=direction or "No reversible term",
-                                      dead_load_for_pd=dead))
+                                      dead_load_for_pd=dead, lateral_axial=lateral,
+                                      coupling_axial=coupling, pd_case=pd.value,
+                                      pd_parts=pd.parts, pd_basis=pd.basis,
+                                      earthquake_case=bool(definition.factors.get("E", 0.0))))
         except (ValueError, TypeError, OverflowError) as error:
             cases.append(LoadCase(**context, actions=Action(math.nan, math.nan, math.nan), error=str(error)))
     return tuple(cases)
@@ -231,7 +287,7 @@ def case_fingerprint(wall: engine.WallInput, case: LoadCase) -> str:
     """Reordering/selection is immaterial; changed wall or source actions is not."""
     geometry = asdict(wall)
     for key in ("edition", "factored_axial", "factored_moment", "factored_shear",
-                "dead_load_compression", "uncracked_area_fraction", "stack_vertical_shear",
+                "dead_load_compression", "pd_basis", "uncracked_area_fraction", "stack_vertical_shear",
                 "oop_check_provided", "oop_utilization", "oop_stability_passed"):
         geometry.pop(key)
     if case.dead_load_for_pd is not None:
@@ -299,6 +355,31 @@ def _governing(results: Sequence[CaseResult], editions: Sequence[str]) -> tuple[
     return tuple(governing)
 
 
+def _resolve_pd(wall: engine.WallInput, case: LoadCase,
+                supplement: CaseSupplement | None) -> tuple[float | None, str]:
+    """The case Pd passed to the engine: a sourced override, the generated
+    composition, or the declared direct-row components; otherwise None."""
+    if supplement is not None and supplement.pd_override is not None:
+        return supplement.pd_override, f"sourced override: {supplement.pd_override_source.strip()}"
+    if case.dead_load_for_pd is not None:
+        _finite(case.dead_load_for_pd, "Counteracting dead load D_cnt")
+        if case.dead_load_for_pd < 0.0:
+            raise ValueError("Counteracting dead load D_cnt cannot be negative; enter tensile actions as the "
+                             "signed lateral axial load or supply a sourced case Pd.")
+    if case.pd_case is not None:
+        return case.pd_case, case.pd_basis
+    if case.lateral_axial is None:
+        return None, "not supplied"
+    if case.dead_load_for_pd is not None:
+        dead, source = case.dead_load_for_pd, "case composition"
+    else:
+        dead = wall.unfactored_dead_load_above + (
+            engine.wall_self_weight(wall) if wall.include_wall_self_weight_in_pd else 0.0)
+        source = "case composition with the wall's dead-load basis"
+    pd = case_pd(dead, case.lateral_axial, case.coupling_axial, source=source)
+    return pd.value, pd.basis
+
+
 def check_load_cases(
     wall: engine.WallInput,
     cases: Sequence[LoadCase],
@@ -334,7 +415,9 @@ def check_load_cases(
                     raise ValueError("Identify the checked section.")
                 _validate_action(case.actions, "Case")
                 if supplement.pd_override is not None:
-                    _finite(supplement.pd_override, "Pd override", nonnegative=True)
+                    _finite(supplement.pd_override, "Pd override")
+                    if not supplement.pd_override_source.strip():
+                        raise ValueError("A Pd override is a signed case Pd from an external source; enter its source.")
                 _finite(supplement.uncracked_area_fraction, "Uncracked area fraction", nonnegative=True)
                 if supplement.uncracked_area_fraction > 1.0:
                     raise ValueError("Uncracked area fraction cannot exceed 1.0.")
@@ -347,14 +430,7 @@ def check_load_cases(
                                               ("Case-specific resistance inputs are stale; review them for the changed wall/actions.",),
                                               fingerprint, supplement_status, supplement))
                     continue
-                pd = None if stale else supplement.pd_override
-                kwargs = {}
-                if case.dead_load_for_pd is not None:
-                    _finite(case.dead_load_for_pd, "Dead load for Pd")
-                    if case.dead_load_for_pd < 0.0 and pd is None:
-                        raise ValueError("Negative net D cannot define default compressive Pd; supply an explicit Pd basis/override.")
-                    kwargs = dict(unfactored_dead_load_above=max(0.0, case.dead_load_for_pd),
-                                  include_wall_self_weight_in_pd=False)
+                pd, pd_basis = _resolve_pd(wall, case, None if stale else supplement)
                 linked = None if stale else supplement.oop.get(edition)
                 if linked is not None:
                     _finite(linked.utilization, f"{edition} OOP utilization", nonnegative=True)
@@ -362,13 +438,12 @@ def check_load_cases(
                 adjusted = replace(
                     wall, edition=edition, factored_axial=case.actions.p,
                     factored_moment=abs(case.actions.m), factored_shear=abs(case.actions.v),
-                    dead_load_compression=pd,
+                    dead_load_compression=pd, pd_basis=pd_basis,
                     uncracked_area_fraction=0.0 if stale else supplement.uncracked_area_fraction,
                     stack_vertical_shear=None if stack is None else abs(stack),
                     oop_check_provided=linked is not None,
                     oop_utilization=linked.utilization if linked else 0.0,
                     oop_stability_passed=linked.stability_passed if linked else False,
-                    **kwargs,
                 )
                 result = engine.calculate_wall(adjusted)
                 checks = _resistance_checks(result)
@@ -413,13 +488,18 @@ def factored_cases_from_rows(rows: Sequence[Mapping[str, object]], *, section: s
         try:
             action = Action(*(_number(row.get(key), key) for key in ("P (kN)", "M (kN-m)", "V (kN)")),
                             stack_v=_number(row.get("Joint V (kN)"), "Joint V", optional=True))
-            dead = _number(row.get("D for Pd (kN)"), "D for Pd", optional=True)
+            dead = _number(row.get(DCNT_COLUMN), "D_cnt", optional=True)
+            lateral = _number(row.get(NLAT_COLUMN), "Signed lateral axial", optional=True)
+            # Only a declared coupling-beam part may add compression to Pd;
+            # blank is the conservative zero.
+            coupling = _number(row.get(NCB_COLUMN), "Coupling-beam axial", optional=True) or 0.0
         except (ValueError, TypeError, OverflowError) as exc:
-            action, dead, error = Action(math.nan, math.nan, math.nan), None, str(exc)
+            action, dead, lateral, coupling, error = Action(math.nan, math.nan, math.nan), None, None, 0.0, str(exc)
         cases.append(LoadCase(_text(row.get("Case ID")), _text(row.get("Name")), action,
                               enabled=row.get("Enabled") is not False,
                               section=section, load_basis=load_basis, dead_load_for_pd=dead,
-                              provenance={"entered_row": dict(row)}, error=error))
+                              provenance={"entered_row": dict(row)}, error=error,
+                              lateral_axial=lateral, coupling_axial=coupling))
     return tuple(cases)
 
 
@@ -459,5 +539,6 @@ def direct_rows_from_cases(cases: Sequence[LoadCase]) -> list[dict[str, object]]
     """Copy totals, including D provenance, without applying factors twice."""
     return [{"Case ID": c.case_id, "Name": c.name, "Enabled": c.enabled,
              "P (kN)": c.actions.p, "M (kN-m)": c.actions.m, "V (kN)": c.actions.v,
-             "Joint V (kN)": c.actions.stack_v, "D for Pd (kN)": c.dead_load_for_pd}
+             "Joint V (kN)": c.actions.stack_v, DCNT_COLUMN: c.dead_load_for_pd,
+             NLAT_COLUMN: c.lateral_axial, NCB_COLUMN: c.coupling_axial}
             for c in cases]

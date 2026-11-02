@@ -4,7 +4,7 @@ from dataclasses import replace
 import math
 import unittest
 
-from in_plane_engine import CalculationError, WallInput, calculate_wall, ties_qualify
+from in_plane_engine import CalculationError, WallInput, calculate_wall, ties_qualify, wall_self_weight
 
 
 class AuditRegressions(unittest.TestCase):
@@ -30,7 +30,9 @@ class AuditRegressions(unittest.TestCase):
             self.assertTrue(any(c.level == "blocked" for c in result.checks))
 
     def test_zero_demand_at_pure_tension_endpoint_is_defined(self):
-        result = calculate_wall(WallInput(factored_axial=-340.0, factored_moment=0.0, factored_shear=0.0, oop_check_provided=True))
+        # WP2: the case Pd (uplift fully counteracting the dead load) is supplied explicitly.
+        result = calculate_wall(WallInput(factored_axial=-340.0, factored_moment=0.0, factored_shear=0.0, oop_check_provided=True,
+                                          dead_load_compression=-340.0))
         self.assertEqual(result.pm_utilization, 0.0)
         self.assertEqual(result.sliding_utilization, 0.0)
         self.assertEqual(result.stability.combined_utilization, 0.0)
@@ -80,8 +82,10 @@ class AuditRegressions(unittest.TestCase):
         self.assertEqual(short.sliding.developed_vertical_area, 0.0)
 
     def test_uplift_is_deducted_from_sliding_clamping(self):
+        # WP2 (F-003): the clamping force is the case Pd, never Pf; a case whose
+        # uplift exceeds 0.9 D_cnt by 100 kN has Pd_case = -100 kN.
         for edition, factor in (("S304-14", 0.6), ("S304:24", 1.0)):
-            result = calculate_wall(WallInput(edition=edition, factored_axial=-100.0))
+            result = calculate_wall(WallInput(edition=edition, factored_axial=-100.0, dead_load_compression=-100.0))
             self.assertAlmostEqual(result.sliding.resistance, factor * (0.85 * 1000 * 400 / 1000 - 100))
             no_dowels = calculate_wall(replace(result.wall, vertical_bars_developed_at_base=False, sliding_plane="Between masonry courses", uncracked_area_fraction=1.0))
             self.assertEqual(no_dowels.sliding.resistance, 0.0)
@@ -125,7 +129,8 @@ class AuditRegressions(unittest.TestCase):
         top = calculate_wall(WallInput(height_above_section=0.0))
         self.assertAlmostEqual(mid.self_weight, base.self_weight / 2)
         self.assertEqual(top.self_weight, 0.0)
-        self.assertEqual(top.pd, 0.9 * 150)
+        # WP2: Pd is formed by the case layer (load_combinations.case_pd), not here.
+        self.assertIsNone(top.pd)
 
     def test_invalid_counts_and_nonfinite_detailing_are_rejected(self):
         for changes in ({"bar_count": 2.5}, {"bar_count": True}, {"developed_vertical_bar_count": 1.5}, {"tie_spacing": math.nan}, {"tie_diameter": math.inf}, {"height_above_section": 6000.0}):
@@ -150,7 +155,9 @@ class OctoberReviewRegressions(unittest.TestCase):
                       factored_axial=100.0, factored_moment=50.0, factored_shear=40.0, unfactored_dead_load_above=80.0,
                       bar_count=0)
         values.update(changes)
-        return WallInput(**values)
+        wall = WallInput(**values)
+        # WP2: the case Pd the pre-patch engine formed, 0.9 (80 kN + self-weight), supplied explicitly.
+        return replace(wall, dead_load_compression=0.9 * (80.0 + wall_self_weight(wall)))
 
     def test_printed_8_10_2_3_is_the_default_and_the_correction_is_opt_in(self):
         printed = calculate_wall(self._unreinforced())

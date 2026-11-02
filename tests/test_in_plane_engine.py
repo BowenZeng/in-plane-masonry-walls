@@ -7,6 +7,12 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+# WP2: the engine has no Pd fallback. Tests that need Pd supply the case Pd of
+# the reference example explicitly: 0.9 (D 150 kN + self-weight 103.0 kN), no
+# lateral axial load (Example 7.4 basis).
+REFERENCE_PD = 0.9 * (150.0 + 103.0)
+REFERENCE_PD_BASIS = "Example 7.4: 0.9 (150 + 103.0) kN; no lateral axial load"
+
 from in_plane_engine import (  # noqa: E402
     BAR_AREAS,
     CalculationError,
@@ -24,6 +30,8 @@ class InPlaneEngineTests(unittest.TestCase):
         self.example = WallInput(
             horizontal_reinforcement_area=0.0,
             shear_method="Simplified",
+            dead_load_compression=REFERENCE_PD,
+            pd_basis=REFERENCE_PD_BASIS,
         )
 
     def test_example_7_1_fully_grouted_flexure(self) -> None:
@@ -234,6 +242,11 @@ class InPlaneEngineTests(unittest.TestCase):
         result = calculate_wall(self.example)
         self.assertAlmostEqual(result.self_weight, 103.0, delta=0.1)
         self.assertAlmostEqual(result.pd, 0.9 * (150.0 + 103.0), delta=0.1)
+        # WP2: without a supplied case Pd the engine forms none (no fallback).
+        unsupplied = calculate_wall(replace(self.example, dead_load_compression=None))
+        self.assertIsNone(unsupplied.pd)
+        self.assertIsNone(unsupplied.sliding.resistance)
+        self.assertEqual(next(c.unresolved for c in unsupplied.checks if c.check_id == "ip.sliding_shear"), "incomplete")
         partial = calculate_wall(
             replace(
                 self.example,
