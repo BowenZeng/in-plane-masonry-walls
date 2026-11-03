@@ -161,6 +161,23 @@ INTERPRETATIONS = {
     "I-31": _register("Unreinforced shear walls", "legacy route only, outside Release 1 scope", "G",
                       "masonry_check has no URM route; UI/batch URM runs carry the seismic gate and the face-shell declaration item",
                       "F-031, F-052, F-090, F-098"),
+    # Release 0.4.0 (biaxial_section.py, plan WP-E2).
+    "I-38": _register("10.8 / 11.8 demonstration for walls (no wall equation; 10.9.3 / 11.9.3 is the column form)",
+                      "plane-section 2-D resistance at fixed P along the applied moment direction "
+                      "(biaxial_section.biaxial_resistance; rotated axis, eps_mu 0.003, 0.85 phi_m f'm,k blocks of "
+                      "depth beta_1,k c, kdev fy tension, tied compression steel only); demand: concurrent signed P, "
+                      "M_ip and total M_oop at the section from a bound, current external second-order record or "
+                      "an enforced reconstruction; the Table 4 Note 2 alternative is not taken; the additive screen "
+                      "stays a diagnostic",
+                      "P",
+                      "section.biaxial_resistance INCOMPLETE without a usable demand; UNSUPPORTED for squat sections "
+                      "with a bar in tension (I-40), net tension and spacing beyond 4t / 6t",
+                      "F-077, F-102"),
+    "I-40": _register("Squat-wall biaxial section method (hw/lw < 1 with a bar in tension)",
+                      "outstanding: no method adopted; WP-E2d establishes, validates and accepts one "
+                      "(SQUAT_BIAXIAL_METHOD_ACCEPTANCE in acceptance_records.py)", "G",
+                      "section.biaxial_resistance UNSUPPORTED for squat sections until the record is filled",
+                      "F-077"),
 }
 
 BAR_PROPERTIES = {
