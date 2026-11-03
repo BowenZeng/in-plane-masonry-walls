@@ -1986,35 +1986,71 @@ def _shear_result(
     )
 
 
+@dataclass(frozen=True)
+class DowelArea:
+    """Dowel steel credited across a sliding plane (register I-13)."""
+
+    raw_area: float
+    effective_area: float
+    kdev: float
+    text: str
+
+
+_ALL_BARS = object()
+
+
+def developed_dowel_area(
+    wall: WallInput,
+    section: SectionProperties | None = None,
+    *,
+    bars_developed: bool | None = None,
+    developed_bar_count: int | None | object = _ALL_BARS,
+    available_development: float | None = None,
+) -> DowelArea:
+    """Developed dowel area across a sliding plane, mm2, with the edition's
+    development rule applied once (register I-13, F-047).
+
+    Defaults are the wall's in-plane sliding inputs. S304:24 Clause 3 C
+    credits As,dev x kdev below ld; S304-14 10.10.5.1 credits only bars
+    detailed to develop fy (none below ld). One helper serves the in-plane
+    and the out-of-plane sliding checks, so the reduction is never applied
+    twice. ``developed_bar_count`` None means every bar.
+    """
+    section = section if section is not None else section_properties(wall, "Discrete")
+    developed = wall.vertical_bars_developed_at_base if bars_developed is None else bars_developed
+    count = wall.developed_vertical_bar_count if developed_bar_count is _ALL_BARS else developed_bar_count
+    available = wall.available_vertical_development if available_development is None else available_development
+    developed_count = 0
+    if wall.wall_type != "Unreinforced masonry" and developed:
+        developed_count = count if count is not None else len(section.bar_positions)
+    raw_area = developed_count * BAR_AREAS[wall.bar_size]
+    developed_area = raw_area
+    ld = _development_length(wall, section, horizontal=False) or 0.0
+    kdev = 1.0
+    development_text = ""
+    if ld > 0.0 and available < ld and developed_area > 0.0:
+        kdev = min(1.0, available / ld)
+        if wall.edition == "S304:24":
+            # Clause 3 C: the factored tensile force that can be developed
+            # (register I-13, F-047).
+            developed_area *= kdev
+            development_text = (f"; dowels developed over {available:.0f} mm < ld "
+                                f"{ld:.1f} mm: As,dev x kdev = {kdev:.4f} (S304:24 Clause 3 C, register I-13)")
+        else:
+            # 10.10.5.1: only bars detailed to develop their yield strength.
+            developed_area = 0.0
+            development_text = (f"; dowels developed over {available:.0f} mm < ld "
+                                f"{ld:.1f} mm are not counted (10.10.5.1: bars detailed to develop fy; register I-13)")
+    return DowelArea(raw_area, developed_area, kdev, development_text)
+
+
 def _sliding_result(
     wall: WallInput,
     section: SectionProperties,
     pd_kN: float | None,
 ) -> SlidingResult:
-    developed_count = 0
-    if wall.wall_type != "Unreinforced masonry" and wall.vertical_bars_developed_at_base:
-        developed_count = (
-            wall.developed_vertical_bar_count
-            if wall.developed_vertical_bar_count is not None
-            else len(section.bar_positions)
-        )
-    developed_area = developed_count * BAR_AREAS[wall.bar_size]
-    ld = _development_length(wall, section, horizontal=False) or 0.0
-    kdev = 1.0
-    development_text = ""
-    if ld > 0.0 and wall.available_vertical_development < ld and developed_area > 0.0:
-        kdev = min(1.0, wall.available_vertical_development / ld)
-        if wall.edition == "S304:24":
-            # Clause 3 C: the factored tensile force that can be developed
-            # (register I-13, F-047).
-            developed_area *= kdev
-            development_text = (f"; dowels developed over {wall.available_vertical_development:.0f} mm < ld "
-                                f"{ld:.1f} mm: As,dev x kdev = {kdev:.4f} (S304:24 Clause 3 C, register I-13)")
-        else:
-            # 10.10.5.1: only bars detailed to develop their yield strength.
-            developed_area = 0.0
-            development_text = (f"; dowels developed over {wall.available_vertical_development:.0f} mm < ld "
-                                f"{ld:.1f} mm are not counted (10.10.5.1: bars detailed to develop fy; register I-13)")
+    dowels = developed_dowel_area(wall, section)
+    developed_area, kdev, development_text = dowels.effective_area, dowels.kdev, dowels.text
     reinforced = wall.wall_type != "Unreinforced masonry"
     edition_factor = PHI_M if wall.edition == "S304-14" else 1.0
     if wall.edition == "S304:24":
@@ -3433,6 +3469,8 @@ __all__ = [
     "Check",
     "DetailingResult",
     "DevelopmentLength",
+    "DowelArea",
+    "developed_dowel_area",
     "InteractionPoint",
     "SectionProperties",
     "ShearResult",

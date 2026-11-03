@@ -296,5 +296,34 @@ class CurrentRepairTests(unittest.TestCase):
         self.assertIn("no enabled row of the project set applies it.", named[0].error)
 
 
+
+class DowelHelperTests(unittest.TestCase):
+    """developed_dowel_area (0.3.0, register I-13): one development reduction shared by the in-plane
+    and out-of-plane sliding checks; the in-plane numbers are unchanged."""
+
+    def test_defaults_reproduce_the_in_plane_sliding_inputs(self):
+        for edition in ("S304-14", "S304:24"):
+            base = wall(edition=edition)
+            dowels = ip.developed_dowel_area(base)
+            self.assertEqual(dowels.raw_area, 5 * ip.BAR_AREAS[base.bar_size])
+            self.assertEqual((dowels.effective_area, dowels.kdev), (dowels.raw_area, 1.0))
+            short = wall(edition=edition, available_vertical_development=200.0)
+            reduced = ip.developed_dowel_area(short)
+            self.assertLess(reduced.kdev, 1.0)
+            expected = reduced.raw_area * reduced.kdev if edition == "S304:24" else 0.0
+            self.assertAlmostEqual(reduced.effective_area, expected, places=12)
+            result = ip.calculate_wall(replace(short, factored_axial=100.0, factored_shear=10.0))
+            self.assertAlmostEqual(result.sliding.developed_vertical_area, reduced.effective_area, places=12)
+
+    def test_explicit_joint_declarations(self):
+        base = wall(edition="S304:24", available_vertical_development=200.0)
+        self.assertEqual(ip.developed_dowel_area(base, bars_developed=False).effective_area, 0.0)
+        four = ip.developed_dowel_area(base, bars_developed=True, developed_bar_count=4, available_development=math.inf)
+        self.assertEqual((four.raw_area, four.effective_area, four.kdev), (4 * 200.0, 4 * 200.0, 1.0))
+        every = ip.developed_dowel_area(base, bars_developed=True, developed_bar_count=None,
+                                        available_development=math.inf)
+        self.assertEqual(every.effective_area, 5 * 200.0)
+
+
 if __name__ == "__main__":
     unittest.main()
