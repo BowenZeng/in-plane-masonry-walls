@@ -75,6 +75,20 @@ def unused_contributions(contributions: Mapping[str, "Action"], combinations: Se
     return nbc.unused_contribution_findings(nonzero, rows, set_name)
 
 
+def _set_label(combinations: Sequence[Combination]) -> str:
+    """Name of the combination set in the unused-contribution message.
+
+    The strings are those the native UI passes (batch_ui._chosen_set), so the
+    message is the same from either entry point.
+    """
+    tags = [set(c.tags) for c in combinations]
+    if tags and all("nbc2025" in t for t in tags):
+        return "NBC 2025"
+    if tags and all("legacy reference" in t for t in tags):
+        return "legacy 14-row reference"
+    return "custom"
+
+
 @dataclass(frozen=True)
 class LoadCase:
     case_id: str
@@ -218,8 +232,15 @@ def generate_load_cases(
     load_basis: str = "Legacy 14-row reference set (not NBC 2025); confirm project load basis",
     coupling_beam_axial: bool = False,
     conditions: nbc.LoadConditions | None = None,
+    set_name: str | None = None,
 ) -> tuple[LoadCase, ...]:
     """Combine signed linear actions; retain invalid formulas as visible cases.
+
+    A non-zero contribution (a NaN counts as non-zero) that no enabled row
+    applies is refused (F-006, C02): every row is then returned as an invalid
+    case naming the omitted contribution, so no batch built from it passes.
+    ``set_name`` names the set in that message (default: inferred from the
+    row tags, "NBC 2025", "legacy 14-row reference" or "custom").
 
     Omitted load types mean zero. A missing stack_v for any contributing load
     leaves the joint demand unknown (explicit zero is distinct from missing).
@@ -234,6 +255,8 @@ def generate_load_cases(
         coupling_beam_axial = coupling_beam_axial or conditions.coupling_beam_axial
     cases = []
     duplicate_ids = {key for key, count in Counter(c.combination_id for c in combinations if c.enabled).items() if count > 1}
+    unused = unused_contributions(contributions, combinations,
+                                  set_name if set_name is not None else _set_label(combinations))
     for definition in combinations:
         context = dict(
             case_id=definition.combination_id, name=definition.name,
@@ -250,6 +273,8 @@ def generate_load_cases(
         try:
             if definition.error:
                 raise ValueError(definition.error)
+            if unused:
+                raise ValueError(" ".join(unused))
             if not definition.combination_id.strip():
                 raise ValueError("Combination ID is required.")
             if definition.combination_id in duplicate_ids:

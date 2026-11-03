@@ -44,13 +44,17 @@ class CombinationTests(unittest.TestCase):
     def test_reference_set_expands_to_23_cases_and_ids_survive_reordering(self):
         # WP1: the legacy set keeps 23 cases for the base load types; the NBC 2025
         # set of the ordinary fixture (one L, one S, no parts) has 33.
-        actions = {key: lc.Action(1, 2, 3) for key in lc.BASE_TYPES}
+        # C02: every non-zero contribution must be applied by an enabled row, so
+        # the legacy set gets D, L, S, W, E and the NBC run also H.
+        actions = {key: lc.Action(1, 2, 3) for key in ("D", "L", "S", "W", "E")}
         forward = lc.generate_load_cases(actions)
         backward = lc.generate_load_cases(actions, tuple(reversed(lc.REFERENCE_COMBINATIONS)))
         self.assertEqual(len(forward), 23)
+        self.assertFalse(any(c.error for c in forward))
         self.assertEqual({c.case_id: c.actions for c in forward}, {c.case_id: c.actions for c in backward})
         conditions = lc.nbc.LoadConditions("Normal", True, "ordinary", "included_in_L", "none")
-        nbc_cases = lc.generate_load_cases(actions, lc.NBC2025_COMBINATIONS(conditions), conditions=conditions)
+        nbc_cases = lc.generate_load_cases(actions | {"H": lc.Action(1, 2, 3)},
+                                           lc.NBC2025_COMBINATIONS(conditions), conditions=conditions)
         self.assertEqual(len(nbc_cases), 33)
         self.assertFalse(any(c.error for c in nbc_cases))
 

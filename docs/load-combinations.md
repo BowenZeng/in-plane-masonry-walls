@@ -203,3 +203,12 @@ flag, uncracked fraction, joint demand, and OOP fields belong to the
 case/supplement. `calculate_wall(WallInput)`
 remains available with unchanged numerical behavior. Added engine metadata
 identifies check categories and selected/alternate curve methods.
+
+`generate_load_cases` refuses a non-zero contribution (including a NaN or a
+`stack_v`-only action) that no enabled row of the supplied set applies: every
+row is then returned as an invalid `LoadCase` whose error names the omitted
+contribution (for example "The Other contribution is non-zero but no enabled
+row of the custom set applies it."), so `check_load_cases` reports INVALID and
+`all_ip_pass` is False. The optional `set_name` names the set in that message;
+by default it is inferred from the row tags ("NBC 2025", "legacy 14-row
+reference" or "custom"), the wording of the native UI.

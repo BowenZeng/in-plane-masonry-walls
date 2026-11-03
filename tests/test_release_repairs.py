@@ -247,5 +247,54 @@ class IntervalWeightTests(unittest.TestCase):
         self.assertEqual(ip.wall_weight_between(partial(bond_beam_levels_above_section=None), 0, 0).weight, 0)
 
 
+
+class CurrentRepairTests(unittest.TestCase):
+    """C02 (review 2026-11-03): the native generator refuses a non-zero
+    contribution that no enabled row applies."""
+
+    MESSAGE = "The Other contribution is non-zero but no enabled row of the custom set applies it."
+
+    def test_c02_unused_contribution_makes_every_row_invalid(self):
+        actions = {"D": lc.Action(p=150), "Other": lc.Action(v=100000)}
+        cases = lc.generate_load_cases(actions, (lc.Combination("D", "dead-only", {"D": 1.4}),))
+        self.assertEqual([(c.case_id, c.error) for c in cases], [("D", self.MESSAGE)])
+        self.assertTrue(all(math.isnan(c.actions.v) for c in cases))
+        batch = lc.check_load_cases(wall(), cases)
+        self.assertEqual({r.edition: r.resistance_status for r in batch.results},
+                         {"S304-14": "INVALID", "S304:24": "INVALID"})
+        self.assertEqual({r.additional_status for r in batch.results}, {"OUTSTANDING"})
+        self.assertFalse(batch.all_ip_pass)
+
+    def test_c02_disabled_rows_do_not_apply_a_contribution(self):
+        rows = (lc.Combination("D", "dead-only", {"D": 1.4}),
+                lc.Combination("O", "other", {"D": 1.0, "Other": 1.0}, enabled=False))
+        cases = lc.generate_load_cases({"D": lc.Action(p=150), "Other": lc.Action(v=10)}, rows)
+        self.assertTrue(all(c.error == self.MESSAGE for c in cases))
+        enabled = (rows[0], replace(rows[1], enabled=True))
+        self.assertFalse(any(c.error for c in lc.generate_load_cases(
+            {"D": lc.Action(p=150), "Other": lc.Action(v=10)}, enabled)))
+
+    def test_c02_zero_and_absent_contributions_are_not_unused_but_stack_v_and_nan_are(self):
+        rows = (lc.Combination("D", "dead-only", {"D": 1.4}),)
+        clean = lc.generate_load_cases({"D": lc.Action(p=150), "Other": lc.Action(0, 0, 0)}, rows)
+        self.assertFalse(any(c.error for c in clean))
+        self.assertFalse(any(c.error for c in lc.generate_load_cases({"D": lc.Action(p=150)}, rows)))
+        for other in (lc.Action(0, 0, 0, stack_v=5.0), lc.Action(math.nan, 0, 0)):
+            with self.subTest(other=other):
+                cases = lc.generate_load_cases({"D": lc.Action(p=150), "Other": other}, rows)
+                self.assertTrue(all(c.error == self.MESSAGE for c in cases))
+
+    def test_c02_set_label_matches_the_native_ui_wording(self):
+        rows = (lc.Combination("D", "dead-only", {"D": 1.4}),)
+        self.assertEqual(lc._set_label(rows), "custom")
+        self.assertEqual(lc._set_label(lc.REFERENCE_COMBINATIONS), "legacy 14-row reference")
+        self.assertEqual(lc._set_label(lc.NBC2025_COMBINATIONS(conditions())), "NBC 2025")
+        legacy = lc.generate_load_cases({"D": lc.Action(p=150), "Other": lc.Action(v=1)})
+        self.assertTrue(all(c.error == "The Other contribution is non-zero but no enabled row of the "
+                            "legacy 14-row reference set applies it." for c in legacy))
+        named = lc.generate_load_cases({"D": lc.Action(p=150), "Other": lc.Action(v=1)}, rows, set_name="project")
+        self.assertIn("no enabled row of the project set applies it.", named[0].error)
+
+
 if __name__ == "__main__":
     unittest.main()
