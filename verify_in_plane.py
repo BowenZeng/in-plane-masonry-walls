@@ -54,7 +54,10 @@ def with_case_pd(wall: WallInput) -> WallInput:
 
 
 def blocked_count(result: object) -> int:
-    return sum(check.level == "blocked" for check in result.checks)
+    # The standard is not supplied: I-21 remains an unresolved review in
+    # every reinforced fixture and is reported separately, never approved.
+    return sum(check.level == "blocked" and check.check_id != "ip.a371_clearance_and_placement"
+               for check in result.checks)
 
 
 def main() -> None:
@@ -91,11 +94,13 @@ def main() -> None:
         Case("missing-base-connection", complete_wall(base_connection_confirmed=False), True),
     )
 
-    rows: list[tuple[str, str, float, float, float, int]] = []
+    rows: list[tuple[str, str, float, float, float, int, int]] = []
     for case in cases:
         for edition in ("S304-14", "S304:24"):
             result = calculate_wall(with_case_pd(replace(case.wall, edition=edition)))
             blocked = blocked_count(result)
+            a371 = [check for check in result.checks if check.check_id == "ip.a371_clearance_and_placement"]
+            assert all(check.kind == "review" and check.level == "blocked" for check in a371)
             if case.expect_blocked:
                 assert blocked > 0, f"{case.name} {edition} should be blocked"
             else:
@@ -117,6 +122,7 @@ def main() -> None:
                     result.shear.resistance,
                     result.sliding.resistance,
                     blocked,
+                    len(a371),
                 )
             )
 
@@ -147,9 +153,10 @@ def main() -> None:
     assert near_squat.moment_resistance <= normal.moment_resistance + 1.0e-9
 
     print(f"VERIFICATION_MATRIX=PASS cases={len(rows)}")
-    print("case,edition,Mr_kNm,Vr_kN,Vslide_kN,blocked")
+    print("A371 clearance/placement remains unverified; its review count is separate from other blocked checks.")
+    print("case,edition,Mr_kNm,Vr_kN,Vslide_kN,other_blocked,A371_reviews")
     for row in rows:
-        print(f"{row[0]},{row[1]},{row[2]:.3f},{row[3]:.3f},{row[4]:.3f},{row[5]}")
+        print(f"{row[0]},{row[1]},{row[2]:.3f},{row[3]:.3f},{row[4]:.3f},{row[5]},{row[6]}")
 
 
 if __name__ == "__main__":

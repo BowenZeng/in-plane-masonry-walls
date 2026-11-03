@@ -31,6 +31,7 @@ EQ_COLUMN = "Earthquake case"
 ADD_SELF_WEIGHT = "Add calculated self-weight"
 SELF_WEIGHT_INCLUDED = "Already included in D"
 DIRECT_SELF_WEIGHT = "Entered Pf includes all factored actions; self-weight is not added"
+CALCULATION_SEMANTICS = "IP release repairs 2026-11 (R02,R04,R06,R09,R13,R14)"
 
 
 @dataclass(frozen=True)
@@ -291,9 +292,8 @@ def generate_load_cases(
                 _validate_action(action, "Combined action")
                 direction = ", ".join(f"{key}{'+' if directions[key] > 0 else '-'}" for key in reversible)
                 case_id = definition.combination_id + suffix
-                lateral = sum(factors[key] * actions[key].p
-                              for key in ("W", "E", "W_fixed", "E_fixed") if factors[key])
-                coupling = factors["E"] * actions["E"].p if coupling_beam_axial and factors["E"] else 0.0
+                lateral, coupling = lateral_axial_components(
+                    {key: action.p for key, action in actions.items()}, factors, coupling_beam_axial)
                 pd = case_pd(dead_counteracting, lateral, coupling)
                 cases.append(LoadCase(**{**context, "case_id": case_id, "factors": factors},
                                       actions=action,
@@ -309,6 +309,14 @@ def generate_load_cases(
     return tuple(cases)
 
 
+def lateral_axial_components(axial_by_type: Mapping[str, float], factors: Mapping[str, float],
+                             coupling_beam_axial: bool) -> tuple[float, float]:
+    """Signed (Nlat, Ncb), including fixed W/E parts without reversing them."""
+    terms = {key: (factors[key] * axial_by_type.get(key, 0.0) if factors.get(key, 0.0) else 0.0)
+             for key in ("W", "E", "W_fixed", "E_fixed")}
+    return sum(terms.values()), (terms["E"] + terms["E_fixed"] if coupling_beam_axial else 0.0)
+
+
 def case_fingerprint(wall: engine.WallInput, case: LoadCase) -> str:
     """Reordering/selection is immaterial; changed wall or source actions is not."""
     geometry = asdict(wall)
@@ -322,7 +330,8 @@ def case_fingerprint(wall: engine.WallInput, case: LoadCase) -> str:
     inputs = asdict(case)
     for key in ("enabled", "name"):
         inputs.pop(key)
-    encoded = json.dumps({"wall": geometry, "case": inputs}, sort_keys=True, default=str)
+    encoded = json.dumps({"semantics": CALCULATION_SEMANTICS, "wall": geometry, "case": inputs},
+                         sort_keys=True, default=str)
     return sha256(encoded.encode("utf-8")).hexdigest()
 
 

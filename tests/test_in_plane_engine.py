@@ -455,7 +455,7 @@ class InPlaneEngineTests(unittest.TestCase):
         )
         self.assertAlmostEqual(linked.stability.combined_utilization, linked.pm_utilization + 0.10)
 
-    def test_complete_rectangular_wall_input_can_clear_every_check(self) -> None:
+    def test_complete_rectangular_wall_keeps_only_unverified_a371_review(self) -> None:
         wall = replace(
             self.example,
             horizontal_reinforcement_type="Bond beam bars",
@@ -475,7 +475,10 @@ class InPlaneEngineTests(unittest.TestCase):
         )
         for edition in ("S304-14", "S304:24"):
             result = calculate_wall(replace(wall, edition=edition))
-            self.assertFalse([c for c in result.checks if c.level != "pass"])
+            pending = [c for c in result.checks if c.level != "pass"]
+            self.assertEqual([c.check_id for c in pending], ["ip.a371_clearance_and_placement"])
+            self.assertEqual(pending[0].kind, "review")
+            self.assertIn("register I-21", pending[0].detail)
 
 
 if __name__ == "__main__":

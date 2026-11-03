@@ -9,7 +9,7 @@ Sentences 4.1.3.2.(2)-(10), the companion-zero rows of 4.1.3.2.(3), the
 1.25D / 0.9D variants of 4.1.3.2.(5), the storage increase of 4.1.3.2.(7),
 Note (6) / Article 4.1.5.5 (p.4-11, PDF 459) for roof live load and parking
 decks, lateral earth pressure 1.5H in cases 2 to 4 (Note A-4.1.3.2.(4)) and
-the soil factors of 4.1.3.2.(8). SLS: Table 4.1.3.4 (p.4-6, PDF 454) with its
+the soil factors of 4.1.3.2.(8)-(9). SLS: Table 4.1.3.4 (p.4-6, PDF 454) with its
 companion-zero rows, Note (2) storage increase and H at 1.0 (4.1.3.4.(4)).
 Crane loads (Table 4.1.3.2.-B) are excluded. P and T are not generated for
 S304 designs (4.1.3.2.(4)).
@@ -22,7 +22,7 @@ parts that exist only when declared (LoadConditions.parts).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from itertools import product
+from itertools import combinations, product
 import math
 from typing import Mapping, Sequence
 
@@ -59,6 +59,7 @@ class LoadConditions:
     soil_resisting: bool = False
     coupling_beam_axial: bool = False
     code: str = "NBC 2025"
+    soil_saturated: bool | None = None
 
     def problems(self) -> list[str]:
         out = []
@@ -83,6 +84,8 @@ class LoadConditions:
         if "D_soil" in self.parts and self.soil_depth_m is not None and (
                 not math.isfinite(self.soil_depth_m) or self.soil_depth_m <= 0.0):
             out.append("Soil depth must be positive.")
+        if self.soil_saturated is not None and type(self.soil_saturated) is not bool:
+            out.append("Soil saturation must be true, false or undeclared.")
         return out
 
     @property
@@ -126,7 +129,9 @@ def _with_dead(factors: dict, dead: float, conditions: LoadConditions, *, case: 
         # The partition allowance is not counteracting dead load (4.1.4.1.(5)).
         out["D_partition"] = 0.0 if (state == "ULS" and dead == 0.9) else dead
     if "D_soil" in parts:
-        if state == "SLS" or case in (1, 5):
+        if state == "ULS" and case == 1:
+            out["D_soil"] = 1.5 if conditions.soil_saturated else 1.4
+        elif state == "SLS" or case == 5:
             out["D_soil"] = dead
         elif dead == 1.25:
             out["D_soil"] = soil_factor(conditions.soil_depth_m)
@@ -146,6 +151,8 @@ def _with_fixed(factors: dict, conditions: LoadConditions) -> dict:
 def uls_set(conditions: LoadConditions) -> tuple[FactorRow, ...]:
     """NBC 2025 Table 4.1.3.2.-A rows for the declared conditions (21 formulas for one L and one S)."""
     problems = conditions.problems()
+    if "D_soil" in conditions.parts and conditions.soil_saturated is None:
+        problems.append("Declare whether D_soil is saturated before generating NBC ULS rows (4.1.3.2.(9)).")
     if problems:
         raise ValueError("NBC 2025 load conditions: " + " ".join(problems))
     parts = conditions.parts
@@ -204,7 +211,24 @@ def uls_set(conditions: LoadConditions) -> tuple[FactorRow, ...]:
         if key in seen:
             continue
         seen.add(key)
-        out.append(FactorRow(row_id, name or _text(factors), factors, "ULS", case, ("nbc2025",) + tags))
+        label = name if name and not parts.intersection(("D_partition", "D_soil")) else _text(factors)
+        out.append(FactorRow(row_id, label, factors, "ULS", case, ("nbc2025",) + tags))
+    # Counteractive allowance/soil must also be omitted in case 5 without
+    # changing permanent D from 1.0. Append siblings so existing row positions
+    # and IDs remain stable. Each factor applies to the entire action vector.
+    removable = [(part, suffix) for part, suffix in (("D_partition", "DP0"), ("D_soil", "DS0"))
+                 if part in parts and (part != "D_soil" or not conditions.soil_resisting)]
+    for row in tuple(out):
+        if row.case != 5:
+            continue
+        for size in range(1, len(removable) + 1):
+            for removed in combinations(removable, size):
+                factors = dict(row.factors)
+                for part, _ in removed:
+                    factors[part] = 0.0
+                suffix = "_" + "_".join(tag for _, tag in removed)
+                out.append(FactorRow(row.row_id + suffix, _text(factors), factors, "ULS", 5,
+                                     row.tags + ("counteracting parts omitted",)))
     return tuple(out)
 
 

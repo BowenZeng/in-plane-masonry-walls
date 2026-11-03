@@ -244,6 +244,28 @@ class StreamlitRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(n1["Pd (kN)"], 0.9 * dead, places=6)
         self.assertFalse(control(self.app, "button", "Copy generated cases to direct mode").disabled)
 
+    def test_soil_saturation_starts_undeclared_and_gates_nbc_rows(self):
+        self.generated_mode()
+        for label, value in ORDINARY_CONDITIONS:
+            control(self.app, "selectbox", label).select("Soil D_soil" if label == "Dead-load parts" else value)
+        control(self.app, "button", "Apply NBC 2025 load conditions").click()
+        self.run_app()
+        selector = control(self.app, "selectbox", "Soil saturation, D_soil only")
+        self.assertEqual(selector.value, "Not declared")
+        self.assertTrue(any("whether D_soil is saturated" in e.value for e in self.app.error))
+        self.assertEqual(self.app.session_state["factor_rows"], [])
+        selector.select("Saturated")
+        control(self.app, "button", "Apply NBC 2025 load conditions").click()
+        self.run_app()
+        rows = self.app.session_state["factor_rows"]
+        self.assertEqual(next(r for r in rows if r["Combination ID"] == "N1")["D_soil"], 1.5)
+        self.assertIn("N50_DS0", [r["Combination ID"] for r in rows])
+        control(self.app, "selectbox", "Soil saturation, D_soil only").select("Not saturated")
+        control(self.app, "button", "Apply NBC 2025 load conditions").click()
+        self.run_app()
+        self.assertEqual(next(r for r in self.app.session_state["factor_rows"]
+                              if r["Combination ID"] == "N1")["D_soil"], 1.4)
+
     def test_unused_nonzero_contribution_is_an_error_naming_the_type(self):
         """F-006: the legacy rows have no H factor, so an entered H makes every case invalid."""
         self.generated_mode(LEGACY_SET)
@@ -496,7 +518,7 @@ class StreamlitRegressionTests(unittest.TestCase):
         self.assertFalse(self.banner())
 
     def test_sfrs_wall_never_reads_checks_clear(self):
-        """WP3: the same reviewed case reads CHECKS CLEAR as a non-SFRS wall and OUTSTANDING as an SFRS wall."""
+        """The seismic gate is independent of the always-unverified A371 review."""
         self.set_cases([case_row("SAFE")])
         self.set_input("checkbox", "Wall-to-foundation force transfer confirmed", True)
         self.set_input("checkbox", "Wall-to-floor/roof force transfer confirmed", True)
@@ -504,9 +526,13 @@ class StreamlitRegressionTests(unittest.TestCase):
         self.save_oop_results()
         frame = self.results()
         self.assertTrue((frame["Supplement review"] == "Reviewed").all())
-        self.assertTrue((frame["Additional checks"] == "CHECKS CLEAR (limited scope)").all())
+        self.assertTrue((frame["Additional checks"] == "OUTSTANDING").all())
+        for checks in tables(self.app, "Check", "Category", "Clause"):
+            statuses = checks.set_index("Check")["Status"]
+            self.assertEqual(set(statuses[~statuses.isin(["PASS", "INFO"])].index),
+                             {"A371 reinforcement clearance and placement"})
         self.declare_seismic("Part of the SFRS (seismic force-resisting system)", "Conventional construction")
-        self.save_oop_results()  # review again, so only the seismic gate differs
+        self.save_oop_results()  # review again; the A371 review stays pending and the seismic gate is added
         frame = self.results()
         self.assertTrue((frame["Supplement review"] == "Reviewed").all())
         self.assertTrue((frame["IP resistance"] == "PASS").all())
@@ -521,7 +547,7 @@ class StreamlitRegressionTests(unittest.TestCase):
             statuses = checks.set_index("Check")["Status"]
             self.assertEqual(statuses["Seismic provisions not evaluated"], "UNSUPPORTED")
             self.assertEqual(set(statuses[~statuses.isin(["PASS", "INFO"])].index),
-                             {"Seismic provisions not evaluated"})
+                             {"Seismic provisions not evaluated", "A371 reinforcement clearance and placement"})
 
     # New engine inputs, F-059, F-070 and the 7.3 floor
 

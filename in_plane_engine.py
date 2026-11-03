@@ -123,8 +123,9 @@ INTERPRETATIONS = {
                       "F-055, F-058, F-068"),
     "I-12": _register("dcs reading",
                       "S304:24 outside masonry surface (t/2 for a centred bar, the wall end for vertical bars, 2s/3); "
-                      "S304-14 'closest masonry surface' = grouted-cell wall (least clear cell / 2); clear cover to "
-                      "the same surface; the 12.4.2.4 / 13.4.2.4 table route offered; 12.4.2.3 with sqrt(f'gr)",
+                      "S304-14 'closest masonry surface' = min(least clear cell / 2, t/2, end_bar_distance); "
+                      "clear cover to that same physical surface, with the separate 2s/3 limit on dcs; "
+                      "the 12.4.2.4 / 13.4.2.4 table route offered; 12.4.2.3 with sqrt(f'gr)",
                       "P", "none", "F-038, F-053, F-141"),
     "I-13": _register("Bars developed over less than ld",
                       "proportional kdev in Mr, Tr and the S304:24 dowel force; S304-14 dowels all-or-nothing",
@@ -536,6 +537,23 @@ class CalculationError(ValueError):
     pass
 
 
+class MissingWeightDeclaration(CalculationError):
+    """The existing geometry inputs can describe the interval, but have not."""
+
+
+class UnsupportedWeightInterval(CalculationError):
+    """The above-section course inventory cannot describe a requested interval."""
+
+
+@dataclass(frozen=True)
+class WallWeightInterval:
+    weight: float
+    uniform_weight: float
+    bond_beam_weight: float
+    lower_elevation: float
+    upper_elevation: float
+
+
 def beta_one(fm: float) -> float:
     return 0.8 if fm <= 20.0 else 0.8 - 0.01 * (fm - 20.0)
 
@@ -791,7 +809,21 @@ def _validate_declarations(wall: WallInput) -> None:
             raise CalculationError(
                 f"Av at each level = {wall.horizontal_reinforcement_area:.1f} mm2 does not equal bars per bond beam x Ab "
                 f"= {n} x {bar_area:.0f} = {n * bar_area:.1f} mm2.")
-    levels = wall.bond_beam_levels_above_section
+    validate_bond_beam_courses(wall)
+    if wall.flexural_reinforcement_distributed not in (None, True, False):
+        raise CalculationError("flexural_reinforcement_distributed must be true, false or not declared.")
+    if wall.sfrs_wall not in (None, True, False):
+        raise CalculationError("sfrs_wall must be true, false or not declared.")
+    if wall.wall_role is not None and wall.wall_role not in WALL_ROLES:
+        raise CalculationError(f"Wall role must be one of {', '.join(WALL_ROLES)}.")
+
+
+def validate_bond_beam_courses(wall: WallInput) -> None:
+    """Reject contradictory course inventories without changing their order."""
+    levels, course = wall.bond_beam_levels_above_section, wall.bond_beam_course_height
+    if course is not None and (isinstance(course, bool) or not isinstance(course, (int, float))
+                               or not math.isfinite(course) or course <= 0.0):
+        raise CalculationError("Bond-beam course height must be positive and finite.")
     if levels is not None:
         if isinstance(levels, bool) or not isinstance(levels, (int, tuple)):
             raise CalculationError("Bond-beam levels above the section: a course count or a list of elevations (mm).")
@@ -806,12 +838,15 @@ def _validate_declarations(wall: WallInput) -> None:
                     f"{height_above:g} mm of wall above the checked section.")
         elif not all(isinstance(z, (int, float)) and not isinstance(z, bool) and math.isfinite(z) for z in levels):
             raise CalculationError("Bond-beam course elevations must be finite numbers (mm above the checked section).")
-    if wall.flexural_reinforcement_distributed not in (None, True, False):
-        raise CalculationError("flexural_reinforcement_distributed must be true, false or not declared.")
-    if wall.sfrs_wall not in (None, True, False):
-        raise CalculationError("sfrs_wall must be true, false or not declared.")
-    if wall.wall_role is not None and wall.wall_role not in WALL_ROLES:
-        raise CalculationError(f"Wall role must be one of {', '.join(WALL_ROLES)}.")
+        else:
+            ordered = sorted(enumerate(levels), key=lambda item: item[1])
+            for (index_a, a), (index_b, b) in zip(ordered, ordered[1:]):
+                if b - a <= 1.0e-9:
+                    raise CalculationError(f"Bond-beam courses {index_a + 1} and {index_b + 1} have duplicate "
+                                           f"elevations ({a:g}, {b:g} mm).")
+                if course is not None and b < a + course - 1.0e-9:
+                    raise CalculationError(f"Bond-beam courses {index_a + 1} and {index_b + 1} overlap: "
+                                           f"[{a:g}, {a + course:g}] and [{b:g}, {b + course:g}] mm.")
 
 
 def _bar_positions(wall: WallInput) -> tuple[float, ...]:
@@ -1018,7 +1053,7 @@ def _bond_beam_grout(wall: WallInput, section: SectionProperties) -> tuple[float
     """
     if (wall.horizontal_reinforcement_type != "Bond beam bars" or wall.horizontal_reinforcement_area <= 0.0
             or (wall.wall_type == "Unreinforced masonry" and wall.unreinforced_condition == "Solid units")
-            or section.grouted_length_fraction >= 1.0 - 1.0e-8):
+            or wall.unit_solid_fraction == 1.0 or section.grouted_length_fraction >= 1.0 - 1.0e-8):
         return 0.0, None, ""
     levels, course = wall.bond_beam_levels_above_section, wall.bond_beam_course_height
     if levels is None or course is None:
@@ -1060,6 +1095,56 @@ def wall_self_weight(wall: WallInput) -> float:
     """Physical wall weight above the checked section, in kN, including the
     grout of the declared bond-beam courses (F-042)."""
     return _wall_self_weight(wall, section_properties(wall, "Discrete"))
+
+
+def wall_weight_between(wall: WallInput, lower_elevation: float, upper_elevation: float) -> WallWeightInterval:
+    """Exact physical weight (kN) between absolute elevations in the wall.
+
+    Course elevations remain relative to the checked IP section. The existing
+    inventory says nothing about courses below that section. A count describes
+    the entire above-section total, but not a proper subinterval of it.
+    """
+    if any(isinstance(z, bool) or not isinstance(z, (int, float)) or not math.isfinite(z)
+           for z in (lower_elevation, upper_elevation)):
+        raise CalculationError("Weight interval elevations must be finite numbers.")
+    if lower_elevation < -1.0e-9 or upper_elevation > wall.height + 1.0e-9 or lower_elevation > upper_elevation:
+        raise CalculationError("Weight interval must be ordered and lie within the total wall height.")
+    low, high = max(0.0, lower_elevation), min(wall.height, upper_elevation)
+    section = section_properties(wall, "Discrete")
+    if high - low <= 1.0e-9:
+        return WallWeightInterval(0.0, 0.0, 0.0, low, high)
+    solid = wall.wall_type == "Unreinforced masonry" and wall.unreinforced_condition == "Solid units"
+    density = (wall.masonry_density if solid else wall.unit_solid_fraction * wall.masonry_density
+               + (1.0 - wall.unit_solid_fraction) * section.grouted_length_fraction * wall.grout_density)
+    volume_per_mm = wall.length * wall.thickness * 1.0e-9
+    uniform = volume_per_mm * (high - low) * density * 9.81 / 1000.0
+    supplemental = (wall.horizontal_reinforcement_type == "Bond beam bars"
+                    and wall.horizontal_reinforcement_area > 0.0 and not solid
+                    and wall.unit_solid_fraction < 1.0 and section.grouted_length_fraction < 1.0 - 1.0e-8)
+    if not supplemental:
+        return WallWeightInterval(uniform, uniform, 0.0, low, high)
+    height_above = wall.height if wall.height_above_section is None else wall.height_above_section
+    section_elevation = wall.height - height_above
+    if low < section_elevation - 1.0e-9:
+        raise UnsupportedWeightInterval("The bond-beam inventory describes only courses above the checked IP "
+                                        "section; weight below that section cannot be reconstructed.")
+    levels, course = wall.bond_beam_levels_above_section, wall.bond_beam_course_height
+    if levels == 0 or levels == ():
+        grouted_height = 0.0
+    elif levels is None or course is None:
+        raise MissingWeightDeclaration("Declare bond_beam_levels_above_section and bond_beam_course_height "
+                                       "to calculate weight between the IP section and OOP station.")
+    elif isinstance(levels, int):
+        if abs(low - section_elevation) > 1.0e-9 or abs(high - wall.height) > 1.0e-9:
+            raise MissingWeightDeclaration("A bond-beam course count cannot locate grout within the wall; "
+                                           "supply course elevations or a direct p_station.")
+        grouted_height = min(levels * course, height_above)
+    else:
+        grouted_height = sum(max(0.0, min(section_elevation + z + course, high)
+                                  - max(section_elevation + z, low)) for z in levels)
+    grout = volume_per_mm * (1.0 - wall.unit_solid_fraction) * (1.0 - section.grouted_length_fraction) \
+        * grouted_height * wall.grout_density * 9.81 / 1000.0
+    return WallWeightInterval(uniform + grout, uniform, grout, low, high)
 
 
 PD_REQUIRED = ("case Pd required: 0.9 x counteracting dead load plus the signed lateral axial load of "
@@ -1144,10 +1229,12 @@ def _vertical_ld(wall: WallInput, section: SectionProperties) -> DevelopmentLeng
                 "clear cover to the same surface (register I-12)")
     else:
         cell = wall.least_clear_cell_dimension
-        dcs = min(cell / 2.0, wall.thickness / 2.0, 2.0 * spacing / 3.0, wall.end_bar_distance)
-        cover = (cell - diameter) / 2.0
+        face = min(cell / 2.0, wall.thickness / 2.0, wall.end_bar_distance)
+        dcs = min(face, 2.0 * spacing / 3.0)
+        cover = face - diameter / 2.0
         text = ("S304-14 12.4.2.3 'closest masonry surface' read as the grouted-cell wall: min(least clear cell / 2, "
-                "t/2, e, 2s/3); clear cover to the cell wall (provisional, register I-12)")
+                "t/2, e, 2s/3); clear cover to the nearest of those physical surfaces "
+                "(provisional, register I-12)")
     clear_spacing = spacing - diameter
     k2 = 1.0
     if wall.epoxy_coated_vertical_bars:
@@ -2328,7 +2415,7 @@ def _checks(
         add(
             wall.vertical_bars_continuous,
             "Minimum vertical reinforcement continuity",
-            "Bars are declared continuous over the wall height." if wall.vertical_bars_continuous else
+            "Bars are declared continuous over the wall height (register I-20)." if wall.vertical_bars_continuous else
             ("Bars declared not continuous and no continuing-bar layout entered: the 10.15.1.1 minimum must be "
              "continuous; terminated-bar layouts (continuing bars, cut-off height, 12.4.8.4 embedment, 12.4.8.5 "
              "cut-off shear) are not modelled (register I-20)."),
@@ -2834,6 +2921,12 @@ def _checks(
             check_id="ip.partial_grout_unit_geometry",
             kind="review",
         )
+    if section.bar_positions or wall.horizontal_reinforcement_area > 0.0:
+        add(False, "A371 reinforcement clearance and placement",
+            "A371 clearance and placement limits have not been verified because that standard was not supplied. "
+            "Confirm the applicable construction requirements independently; the numeric S304 bar-fit checks "
+            "do not establish A371 compliance (register I-21).",
+            "CSA A371 (not supplied)", check_id="ip.a371_clearance_and_placement", kind="review")
     grout_weight, grout_status, grout_text = flexure.bond_beam_grout
     if grout_status is not None:
         add(
@@ -3048,8 +3141,8 @@ def _checks(
 def _k1_text(wall: WallInput) -> str:
     """Bar-location factor k1 of the bond-beam bars and its declared basis (register I-16)."""
     if wall.horizontal_top_bar:
-        return "k1 = 1.3 (declared: more than 300 mm of fresh grout below the bars)"
-    return "k1 = 1.0 (declared: 300 mm or less of fresh grout below the bars)"
+        return "k1 = 1.3 (declared: more than 300 mm of fresh grout below the bars; register I-16)"
+    return "k1 = 1.0 (declared: 300 mm or less of fresh grout below the bars; register I-16)"
 
 
 def _fmt(value: float | None, digits: int = 3) -> str:
@@ -3335,6 +3428,8 @@ __all__ = [
     "UNIT_FACE_SHELL_REFERENCE",
     "WALL_ROLES",
     "CalculationError",
+    "MissingWeightDeclaration",
+    "UnsupportedWeightInterval",
     "Check",
     "DetailingResult",
     "DevelopmentLength",
@@ -3346,6 +3441,7 @@ __all__ = [
     "TraceEntry",
     "WallInput",
     "WallResult",
+    "WallWeightInterval",
     "beta_one",
     "calculate_wall",
     "demand_utilization",
@@ -3356,5 +3452,7 @@ __all__ = [
     "section_point_at_c",
     "section_properties",
     "ties_qualify",
+    "validate_bond_beam_courses",
     "wall_self_weight",
+    "wall_weight_between",
 ]

@@ -119,7 +119,8 @@ def _initialize() -> None:
         "custom_factor_rows": _factor_rows(lc.REFERENCE_COMBINATIONS),
         "nbc_conditions": {"importance": UNDECLARED, "occupancy": UNDECLARED, "roof": UNDECLARED,
                            "deck": UNDECLARED, "dead_parts": UNDECLARED, "fixed_parts": UNDECLARED,
-                           "soil_depth_m": None, "soil_resisting": False, "coupling_beam_axial": False},
+                           "soil_depth_m": None, "soil_resisting": False, "soil_saturated": UNDECLARED,
+                           "coupling_beam_axial": False},
         "nbc_version": 0,
         "seismic_declaration": {"system": UNDECLARED, "sfrs_type": UNDECLARED, "wall_role": UNDECLARED,
                                 "analysis_basis": UNDECLARED, "urm_permitted": False},
@@ -187,13 +188,17 @@ def _conditions() -> tuple[nbc.LoadConditions | None, list[str]]:
     if deck != "none":
         parts |= {"L_deck", "S_deck"}
     soil = "D_soil" in parts
+    saturation = declared.get("soil_saturated", UNDECLARED)
+    if soil and saturation == UNDECLARED:
+        return None, ["whether D_soil is saturated"]
     # Only ULS rows are generated here: S and W are the ULS-specified loads.
     return nbc.LoadConditions(
         importance_category=declared["importance"], uls_specified=True,
         occupancy=OCCUPANCY_OPTIONS[declared["occupancy"]], roof_live_load=roof, parking_deck=deck,
         parts=frozenset(parts), soil_depth_m=declared["soil_depth_m"] if soil else None,
         soil_resisting=bool(declared["soil_resisting"]) and soil,
-        coupling_beam_axial=bool(declared["coupling_beam_axial"])), []
+        coupling_beam_axial=bool(declared["coupling_beam_axial"]),
+        soil_saturated=(saturation == "Saturated") if soil else None), []
 
 
 def _chosen_set() -> tuple[tuple[lc.Combination, ...], nbc.LoadConditions | None, str, str]:
@@ -236,7 +241,8 @@ def _conditions_form() -> None:
                     "Note (6): deck snow S_deck and deck live load L_deck rows; enter both contributions.")
         dead = pick(columns[1], "Dead-load parts", DEAD_PART_OPTIONS, "dead_parts",
                     "4.1.4.1.(5)-(6), 4.1.3.2.(8): the partition allowance is never counteracting (0.9D rows and "
-                    "D_cnt exclude it); soil takes 1.5 (or the hs factor) in the 1.25D rows.")
+                    "D_cnt exclude it); case 5 also includes counteracting-part omissions. Soil takes 1.5 "
+                    "(or the hs factor) in the 1.25D rows and 1.5 when saturated in case 1.")
         fixed = pick(columns[2], "Fixed parts of W and E", FIXED_PART_OPTIONS, "fixed_parts",
                      "Parts of W or E that do not reverse with the load (e.g. uplift): same factor as W / E, never "
                      "reversed, signed in N_lat.")
@@ -248,6 +254,14 @@ def _conditions_form() -> None:
             "Soil is part of the load-resisting system", value=declared["soil_resisting"],
             key=f"nbc_soil_resisting_{version}",
             help="4.1.4.1.(6): only then does soil enter the 0.9D rows and D_cnt. Unchecked = no credit.")
+        soil_saturated = declared.get("soil_saturated", UNDECLARED)
+        if "D_soil" in (DEAD_PART_OPTIONS.get(dead) or ()):
+            saturation_options = [UNDECLARED, "Saturated", "Not saturated"]
+            soil_saturated = columns[0].selectbox(
+                "Soil saturation, D_soil only", saturation_options,
+                index=saturation_options.index(soil_saturated), key=f"nbc_soil_saturated_{version}",
+                help="4.1.3.2.(9): case 1 uses 1.5 on saturated soil and 1.4 on explicitly nonsaturated soil. "
+                     "Declare this before NBC ULS rows are generated.")
         coupling = columns[2].checkbox(
             "E axial load is coupling-beam axial load", value=declared["coupling_beam_axial"],
             key=f"nbc_coupling_{version}",
@@ -257,7 +271,8 @@ def _conditions_form() -> None:
                 "importance": importance, "occupancy": occupancy, "roof": roof, "deck": deck,
                 "dead_parts": dead, "fixed_parts": fixed,
                 "soil_depth_m": None if soil_depth is None else float(soil_depth),
-                "soil_resisting": bool(soil_resisting), "coupling_beam_axial": bool(coupling)}
+                "soil_resisting": bool(soil_resisting), "soil_saturated": soil_saturated,
+                "coupling_beam_axial": bool(coupling)}
             st.session_state.nbc_version += 1
             st.rerun()
 

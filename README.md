@@ -24,12 +24,20 @@ crane cases as direct factored cases. W/E vectors are reversed in full,
 including axial load; fixed parts never reverse. A non-zero contribution that
 no enabled row applies makes every generated case invalid.
 
+Case 5 also evaluates every applicable omission of the separately declared
+partition allowance and non-resisting soil. These appended siblings use
+`_DP0`, `_DS0` and `_DP0_DS0` IDs; permanent D stays at 1.0 and existing IDs
+keep their order. If D_soil is entered, declare whether it is saturated before
+NBC ULS generation: case 1 uses 1.5 for saturated soil and 1.4 for explicitly
+nonsaturated soil. The declaration starts unresolved; custom/legacy and SLS
+factors do not acquire this prerequisite.
+
 Generated self-weight is either added once to D or declared already included.
 Direct Pf is never increased automatically. Each case's Pd = 0.9 D_cnt +
 min(0, N_lat - N_cb) + N_cb, where D_cnt is the permanent dead load plus the
 self-weight above the section (no partition allowance, soil only where it
 resists), N_lat the case's signed W/E axial load and N_cb its declared
-coupling-beam part; live and snow loads never enter Pd. Direct rows without
+coupling-beam part, including fixed E axial force; live and snow loads never enter Pd. Direct rows without
 N_lat leave sliding and the Pd-dependent shear routes INCOMPLETE. Case-specific
 overrides and linked OOP results must be reviewed again when their wall or
 source actions change.
@@ -60,6 +68,16 @@ anchorage, bars per bond beam and their clear spacing, bond-beam courses above
 the section, joint-reinforcement f'gr in Type N mortar, distributed flexural
 reinforcement, grout type, lap length, S304:24 minimum face shell) start blank:
 blank means not declared and gives no credit.
+
+Bond-beam course elevations are bottoms of courses measured above the checked
+IP section. Duplicate or overlapping courses are rejected; touching courses
+are allowed and valid courses are clipped at the section and wall top.
+`wall_self_weight` retains the above-section total, including course-count
+inputs. `wall_weight_between` integrates uniform weight and exact course
+intersections at absolute wall elevations for station adjustments. A count
+cannot locate grout at an interior station, and the above-section inventory
+cannot establish courses below that section; these cases require additional
+declarations or an explicitly calculated station force at the calling interface.
 
 See the [load-case guide](docs/load-combinations.md) for worked examples, input
 conventions, second-order analysis, exports, and the Python batch API.
