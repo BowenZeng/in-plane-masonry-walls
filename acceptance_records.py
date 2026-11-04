@@ -29,23 +29,13 @@ def file_sha256(name: str) -> str:
 
 
 def squat_method_status(record: dict | None = None) -> tuple[bool, str]:
-    """(accepted, reason) of the squat-wall biaxial method (I-40)."""
-    record = SQUAT_BIAXIAL_METHOD_ACCEPTANCE if record is None else record
-    if not record:
-        return False, "squat-wall biaxial method outstanding (WP-E2d, register I-40): no accepted method"
-    missing = [key for key in SQUAT_RECORD_KEYS if not record.get(key)]
-    if missing:
-        return False, "the squat-wall method acceptance record is incomplete: " + ", ".join(missing)
-    stale = []
-    for name, digest in record["evidence"].items():
-        try:
-            if file_sha256(name) != digest:
-                stale.append(name)
-        except OSError:
-            stale.append(name)
-    if stale:
-        return False, "acceptance evidence stale: " + ", ".join(stale)
-    return True, f"{record['method']} (accepted {record['decision_date']} by {record['decided_by']})"
+    """Option (c), owner decision 4 November 2026: no implemented squat method.
+
+    A populated dictionary cannot implement a calculation or establish its
+    applicability. Keep the argument and record symbol for API compatibility.
+    """
+    return False, ("squat-wall biaxial method outstanding (WP-E2d, register I-40): "
+                   "option (c), UNSUPPORTED; no accepted method is implemented")
 
 
 __all__ = ["SQUAT_BIAXIAL_METHOD_ACCEPTANCE", "file_sha256", "squat_method_status"]

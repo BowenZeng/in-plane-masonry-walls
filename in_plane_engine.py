@@ -174,9 +174,9 @@ INTERPRETATIONS = {
                       "with a bar in tension (I-40), net tension and spacing beyond 4t / 6t",
                       "F-077, F-102"),
     "I-40": _register("Squat-wall biaxial section method (hw/lw < 1 with a bar in tension)",
-                      "outstanding: no method adopted; WP-E2d establishes, validates and accepts one "
-                      "(SQUAT_BIAXIAL_METHOD_ACCEPTANCE in acceptance_records.py)", "G",
-                      "section.biaxial_resistance UNSUPPORTED for squat sections until the record is filled",
+                      "owner decision 2026-11-04: option (c), keep UNSUPPORTED; no squat method implemented", "G",
+                      "section.biaxial_resistance UNSUPPORTED for squat sections with tension steel; "
+                      "an acceptance dictionary cannot activate the general model",
                       "F-077"),
 }
 

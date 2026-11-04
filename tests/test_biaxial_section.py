@@ -98,9 +98,9 @@ class RegisterAndAcceptanceTests(unittest.TestCase):
                       decision_date="2026-11-03", decided_by="MOCK",
                       evidence={n: acceptance_records.file_sha256(n) for n in ("biaxial_section.py", "in_plane_engine.py")})
         with mock.patch.object(acceptance_records, "SQUAT_BIAXIAL_METHOD_ACCEPTANCE", record):
-            self.assertTrue(acceptance_records.squat_method_status()[0])
+            self.assertFalse(acceptance_records.squat_method_status()[0])
         stale = dict(record, evidence={"biaxial_section.py": "0" * 64})
-        self.assertEqual(acceptance_records.squat_method_status(stale), (False, "acceptance evidence stale: biaxial_section.py"))
+        self.assertFalse(acceptance_records.squat_method_status(stale)[0])
 
 
 
