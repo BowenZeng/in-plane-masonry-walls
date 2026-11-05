@@ -7,16 +7,33 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+# WP2: the engine has no Pd fallback. Tests that need Pd supply the case Pd of
+# the reference example explicitly: 0.9 (D 150 kN + self-weight 103.0 kN), no
+# lateral axial load (Example 7.4 basis).
+REFERENCE_PD = 0.9 * (150.0 + 103.0)
+REFERENCE_PD_BASIS = "Example 7.4: 0.9 (150 + 103.0) kN; no lateral axial load"
+
 from in_plane_engine import (  # noqa: E402
     BAR_AREAS,
     CalculationError,
-    WallInput,
+    UNIT_FACE_SHELL_REFERENCE,
     calculate_wall,
     interaction_curve,
     moment_at_axial_load,
     section_point_at_c,
     section_properties,
 )
+from in_plane_engine import WallInput as _EngineWallInput  # noqa: E402
+
+
+def WallInput(**values):  # noqa: N802 - fixture with the engine's signature
+    """WP4: the least clear cell has no engine default; fixtures declare the unit's
+    cell, min(100, t - 2 tf) with the reference mortar-bedded face shell."""
+    if "least_clear_cell_dimension" not in values:
+        t = values.get("thickness", 190.0)
+        tf = values.get("face_shell_thickness") or UNIT_FACE_SHELL_REFERENCE["mortar_bedded"][float(t)]
+        values["least_clear_cell_dimension"] = min(100.0, t - 2.0 * tf)
+    return _EngineWallInput(**values)
 
 
 class InPlaneEngineTests(unittest.TestCase):
@@ -24,6 +41,8 @@ class InPlaneEngineTests(unittest.TestCase):
         self.example = WallInput(
             horizontal_reinforcement_area=0.0,
             shear_method="Simplified",
+            dead_load_compression=REFERENCE_PD,
+            pd_basis=REFERENCE_PD_BASIS,
         )
 
     def test_example_7_1_fully_grouted_flexure(self) -> None:
@@ -172,6 +191,25 @@ class InPlaneEngineTests(unittest.TestCase):
         squat = calculate_wall(replace(self.example, height=4500.0, factored_axial=0.0))
         self.assertLessEqual(squat.moment_resistance, normal.moment_resistance + 1.0e-8)
 
+    def test_undecided_shear_steel_requirement_leaves_its_details_incomplete(self) -> None:
+        # S304-14, 4000 x 3000, Pf 200, Vf 60, Mf 150 kN m, 15M bond beams (Av 200) at 2400 mm.
+        # Without the case Pd the no-steel Vr is unknown: the 10.15.1.4 spacing is
+        # INCOMPLETE, not FAIL. With Pd 179.49 kN, Vm 221.74 kN >= Vf 60 kN: not required.
+        wall = WallInput(edition="S304-14", length=4000.0, height=3000.0, factored_axial=200.0,
+                         factored_shear=60.0, factored_moment=150.0, horizontal_reinforcement_type="Bond beam bars",
+                         horizontal_bar_size="15M", horizontal_reinforcement_area=200.0,
+                         horizontal_reinforcement_spacing=2400.0, bond_beam_anchorage="standard_hook")
+        spacing = lambda result: next(c for c in result.checks
+                                      if c.check_id == "ip.horizontal_shear_reinforcement_spacing")
+        undecided = calculate_wall(wall)
+        self.assertIsNone(undecided.shear.horizontal_steel_required)
+        self.assertEqual((spacing(undecided).level, spacing(undecided).unresolved), ("blocked", "incomplete"))
+        self.assertIn("undecided", spacing(undecided).detail)
+        decided = calculate_wall(replace(wall, dead_load_compression=179.49, pd_basis="test: declared case Pd"))
+        self.assertFalse(decided.shear.horizontal_steel_required)
+        self.assertAlmostEqual(decided.shear.resistance_without_horizontal_steel, 221.74, places=2)
+        self.assertEqual((spacing(decided).level, spacing(decided).kind), ("pass", "info"))
+
     def test_vertical_bar_spacing_over_2400_is_blocked(self) -> None:
         result = calculate_wall(
             replace(
@@ -234,6 +272,11 @@ class InPlaneEngineTests(unittest.TestCase):
         result = calculate_wall(self.example)
         self.assertAlmostEqual(result.self_weight, 103.0, delta=0.1)
         self.assertAlmostEqual(result.pd, 0.9 * (150.0 + 103.0), delta=0.1)
+        # WP2: without a supplied case Pd the engine forms none (no fallback).
+        unsupplied = calculate_wall(replace(self.example, dead_load_compression=None))
+        self.assertIsNone(unsupplied.pd)
+        self.assertIsNone(unsupplied.sliding.resistance)
+        self.assertEqual(next(c.unresolved for c in unsupplied.checks if c.check_id == "ip.sliding_shear"), "incomplete")
         partial = calculate_wall(
             replace(
                 self.example,
@@ -251,12 +294,19 @@ class InPlaneEngineTests(unittest.TestCase):
                 horizontal_reinforcement_area=200.0,
                 horizontal_reinforcement_spacing=200.0,
                 horizontal_anchorage_confirmed=False,
+                # F-074: two 10M bars per level (Av 200 > Ab 100) at a declared
+                # 40 mm clear spacing inside the bond beam.
+                bars_per_bond_beam=2,
+                bond_beam_bar_clear_spacing=40.0,
             )
         )
+        # F-080: bond-beam bars are credited only with a declared end anchorage
+        # (a standard hook anchors 15M and smaller bars, 12.4.11.2 / 13.4.11.2).
+        self.assertIsNone(unanchored.wall.bond_beam_anchorage)
         anchored = calculate_wall(
             replace(
                 unanchored.wall,
-                horizontal_anchorage_confirmed=True,
+                bond_beam_anchorage="standard_hook",
                 horizontal_continuity_confirmed=True,
             )
         )
@@ -264,24 +314,37 @@ class InPlaneEngineTests(unittest.TestCase):
         self.assertGreater(anchored.shear.steel_resistance, 0.0)
 
     def test_bond_beam_development_is_checked(self) -> None:
-        result = calculate_wall(
-            replace(
-                self.example,
-                horizontal_reinforcement_type="Bond beam bars",
-                horizontal_reinforcement_area=200.0,
-                horizontal_bar_size="15M",
-                horizontal_anchorage_confirmed=True,
-                horizontal_continuity_confirmed=True,
-                available_horizontal_development=100.0,
-            )
+        # F-066: the item is a requirement only where the steel is needed for
+        # in-plane shear; Vf = 300 kN exceeds Vr without horizontal steel
+        # (267.3 kN), so the short development is blocked.
+        wall = replace(
+            self.example,
+            factored_shear=300.0,
+            horizontal_reinforcement_type="Bond beam bars",
+            horizontal_reinforcement_area=200.0,
+            horizontal_bar_size="15M",
+            bond_beam_anchorage="standard_hook",
+            horizontal_continuity_confirmed=True,
+            available_horizontal_development=100.0,
         )
+        result = calculate_wall(wall)
         check = next(c for c in result.checks if c.title == "Bond-beam-bar development")
         self.assertEqual(check.level, "blocked")
+        self.assertEqual(result.shear.steel_resistance, 0.0)
+        # At Vf = 200 kN <= Vm = 233.96 kN the steel is not required: information only.
+        not_required = calculate_wall(replace(wall, factored_shear=200.0))
+        check = next(c for c in not_required.checks if c.title == "Bond-beam-bar development")
+        self.assertEqual((check.level, check.kind), ("pass", "info"))
+        self.assertIn("Not required for in-plane shear", check.detail)
 
     def test_joint_reinforcement_uses_600_mm_and_wire_diameter_limits(self) -> None:
+        # F-066: the spacing limit applies where the steel is required for
+        # in-plane shear (Vf = 300 kN > Vr without it, 267.3 kN); the 12.1.4
+        # wire-diameter limit is unconditional.
         result = calculate_wall(
             replace(
                 self.example,
+                factored_shear=300.0,
                 horizontal_reinforcement_type="Joint reinforcement",
                 horizontal_reinforcement_area=21.0,
                 horizontal_reinforcement_spacing=800.0,
@@ -311,6 +374,7 @@ class InPlaneEngineTests(unittest.TestCase):
         self.assertAlmostEqual(result.shear.beta, 0.02471776589423648, places=12)
 
     def test_between_course_sliding_reports_bond_route_and_dowel_area(self) -> None:
+        # Hollow URM default wall: Pd = 0.9 (150 + 54.80) = 184.32 kN; no uncracked-area credit by default (F-045).
         result = calculate_wall(
             replace(
                 self.example,
@@ -318,10 +382,13 @@ class InPlaneEngineTests(unittest.TestCase):
                 bar_count=0,
                 sliding_plane="Between masonry courses",
                 factored_shear=400.0,
+                dead_load_compression=0.9 * (150.0 + 54.80),
             )
         )
         self.assertIsNotNone(result.sliding.bond_route)
         self.assertGreater(result.sliding.required_dowel_area, 0.0)
+        self.assertEqual(result.wall.uncracked_area_fraction, 0.0)
+        self.assertAlmostEqual(result.sliding.resistance, 110.59, delta=0.005)
 
     def test_development_lap_and_clearance_checks_block_bad_detail(self) -> None:
         result = calculate_wall(
@@ -359,7 +426,8 @@ class InPlaneEngineTests(unittest.TestCase):
                 bond_pattern="Stack pattern",
                 horizontal_reinforcement_type="Bond beam bars",
                 horizontal_reinforcement_area=200.0,
-                horizontal_anchorage_confirmed=True,
+                bond_beam_anchorage="standard_hook",  # F-080: declared end anchorage
+                bars_per_bond_beam=2, bond_beam_bar_clear_spacing=40.0,  # F-074: two 10M per level
                 horizontal_continuity_confirmed=True,
                 stack_joint_area=1000.0,
                 stack_vertical_shear=150.0,
@@ -387,23 +455,30 @@ class InPlaneEngineTests(unittest.TestCase):
         )
         self.assertAlmostEqual(linked.stability.combined_utilization, linked.pm_utilization + 0.10)
 
-    def test_complete_rectangular_wall_input_can_clear_every_check(self) -> None:
+    def test_complete_rectangular_wall_keeps_only_unverified_a371_review(self) -> None:
         wall = replace(
             self.example,
             horizontal_reinforcement_type="Bond beam bars",
             horizontal_bar_size="15M",
             horizontal_reinforcement_area=200.0,
-            horizontal_anchorage_confirmed=True,
+            bond_beam_anchorage="standard_hook",  # F-080: declared end anchorage
             horizontal_continuity_confirmed=True,
             base_connection_confirmed=True,
             top_connection_confirmed=True,
             oop_check_provided=True,
             oop_stability_passed=True,
             oop_utilization=0.05,
+            # WP3: declared not part of the SFRS, in a case without E, and the
+            # wall role declared (no seismic or infill gate applies).
+            sfrs_wall=False,
+            wall_role="loadbearing_shear_wall",
         )
         for edition in ("S304-14", "S304:24"):
             result = calculate_wall(replace(wall, edition=edition))
-            self.assertFalse([c for c in result.checks if c.level != "pass"])
+            pending = [c for c in result.checks if c.level != "pass"]
+            self.assertEqual([c.check_id for c in pending], ["ip.a371_clearance_and_placement"])
+            self.assertEqual(pending[0].kind, "review")
+            self.assertIn("register I-21", pending[0].detail)
 
 
 if __name__ == "__main__":
