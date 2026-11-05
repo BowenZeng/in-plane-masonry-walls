@@ -1,0 +1,4 @@
+# Calculation provenance hashes exact bytes; preserve the reviewed checkout.
+*.py -text whitespace=cr-at-eol
+*.json -text whitespace=cr-at-eol
+.gitattributes text eol=lf
