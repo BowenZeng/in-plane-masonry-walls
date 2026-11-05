@@ -64,8 +64,12 @@ import time
 
 import numpy as np
 
-from in_plane_engine import WallInput, calculate_wall
-from biaxial_section import biaxial_resistance
+if __package__:
+    from .in_plane_engine import WallInput, calculate_wall
+    from .biaxial_section import biaxial_resistance
+else:
+    from in_plane_engine import WallInput, calculate_wall
+    from biaxial_section import biaxial_resistance
 
 
 PHI_M = 0.60
